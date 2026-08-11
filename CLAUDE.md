@@ -30,8 +30,9 @@ Git 管理下にある。壊したら `git checkout .` で戻せる。段階ご�
 | `Program.cs` | 全実装。約 2400 行 |
 | `TaskbarMeter.csproj` | 配布設定（self-contained, PublishSingleFile） |
 | `build.cmd` | 開発用。プロセス終了 → publish → 起動。日本語を含めない（文字コードで壊れた実績あり） |
-| `release.cmd` | 配布用。publish → `dist\TaskbarMeter.zip` を作る。同じく日本語を含めない |
+| `release.cmd` | 配布用。publish → `dist\TaskbarMeter.zip` と `dist\release-notes.md`。同じく日本語を含めない |
 | `dist-template\` | ZIP に同梱するファイル（`お読みください.txt`） |
+| `release-notes.template.md` | リリースページの雛形。`{DATE}` が置換される |
 | `はじめかた.md` | 配布相手（初心者）向けのセットアップ手順 |
 | `説明書.md` | 全機能の説明とトラブル対処 |
 | `仕様書.md` | 中身の仕組み。先生に見せる前提の技術説明 |
@@ -156,6 +157,10 @@ GDI+ の文字描画は使っていない。
 **自動更新は入れられない。** 更新確認は通信なので「通信しない」約束と両立しない。
 配布は `releases/latest/download/TaskbarMeter.zip`（固定名 = URL 不変）で、
 相手が自分で取りに来る形にしてある。ZIP 名に version を入れると URL が変わるので入れないこと。
+
+**リリースページには変更点を書かない。** 日付とダウンロード導線だけの短いページにする方針
+（作者の指示）。落としに来た人の前でリンクが埋もれるのを避けるため。
+変更の履歴は `git log` が担う。動線は README →（直リンクで ZIP）→ はじめかた.md。
 
 ## 実装済みの機能
 

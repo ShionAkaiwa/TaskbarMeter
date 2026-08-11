@@ -35,14 +35,20 @@ if not exist "dist\TaskbarMeter.zip" (
     exit /b 1
 )
 
+rem Stamp today's date into the release notes. The template holds the Japanese
+rem text so that no Japanese literal has to appear in this script.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$d = Get-Date -Format 'yyyy-MM-dd'; $t = [IO.File]::ReadAllText('release-notes.template.md'); [IO.File]::WriteAllText('dist\release-notes.md', $t.Replace('{DATE}', $d), (New-Object Text.UTF8Encoding $false))"
+
 echo.
-echo Done.  dist\TaskbarMeter.zip
+echo Done.
+echo   dist\TaskbarMeter.zip
+echo   dist\release-notes.md
 echo.
 echo The asset name has no version in it on purpose, so this link always
 echo points at the newest build:
 echo   https://github.com/ShionAkaiwa/TaskbarMeter/releases/latest/download/TaskbarMeter.zip
 echo.
-echo Publish it with:
-echo   gh release create v1.2 dist\TaskbarMeter.zip --title "TaskbarMeter v1.2" --notes "what changed"
+echo Publish it with (bump the version):
+echo   gh release create v1.2 dist\TaskbarMeter.zip --title "TaskbarMeter v1.2" --notes-file dist\release-notes.md
 echo.
 pause

@@ -3,14 +3,19 @@
 Windows のタスクバー（通知領域）に、CPU / GPU / VRAM などの使用率をアイコンで常時表示する常駐アプリ。
 深層学習の学習中に「今どれくらい回っているか」を横目で見られるように作っています。
 
-> ### 🚀 使ってみたい方はこちら
-> **[① ZIP をダウンロード（Releases）](../../releases/latest)** → **[② はじめかた.md を読む](はじめかた.md)**
->
-> インストールは不要です。ZIP を展開してダブルクリックするだけで動きます。
-> 管理者権限も、インターネット接続も要りません。
->
-> ⚠️ 配布は **ZIP** で行っています。exe を直接ダウンロードすると
-> 「一般的にダウンロードされていません」とブラウザに止められます。
+## 🚀 ダウンロードはこちら
+
+### ⬇ **[TaskbarMeter.zip をダウンロード](../../releases/latest/download/TaskbarMeter.zip)**
+
+いつでも最新版が落ちてきます。インストールは不要、管理者権限も要りません。
+
+### 落とせたら → **[はじめかた.md を開く](はじめかた.md)**
+
+展開してダブルクリックするだけです。所要 1 分。
+
+<sub>過去の版は [Releases](../../releases) にあります。</sub>
+
+---
 
 | ドキュメント | 対象 |
 |---|---|
@@ -103,12 +108,25 @@ ZIP に包むとこの警告は出ません（起動時の SmartScreen 警告は
 release.cmd
 ```
 
-ビルドから梱包までやって `dist\TaskbarMeter.zip` を作ります。
-中身は exe と `dist-template\お読みください.txt` です。あとは添付するだけ。
+これで 2 つ出来ます。
+
+- `dist\TaskbarMeter.zip` … exe と `dist-template\お読みください.txt`
+- `dist\release-notes.md` … `release-notes.template.md` に日付を入れたもの
+
+あとは版番号を上げて添付するだけです。
 
 ```bash
-gh release create v1.2 dist\TaskbarMeter.zip --title "TaskbarMeter v1.2" --notes "変更点"
+gh release create v1.2 dist\TaskbarMeter.zip --title "TaskbarMeter v1.2" --notes-file dist\release-notes.md
 ```
+
+### リリースページに変更点は書かない
+
+**日付とダウンロード導線だけの短いページにしてあります。**
+リリースページは「落として使いたい人」が来る場所で、変更点を読みに来る場所ではありません。
+長いと肝心のダウンロードリンクが埋もれます。
+
+変更の履歴は `git log` に残ります。コミットメッセージに何をなぜ変えたかを書いておけば、
+それが記録として十分機能します。
 
 ### ZIP の名前に version を入れないこと
 
