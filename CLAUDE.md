@@ -21,14 +21,17 @@ build.cmd
 出力: `bin\Release\net8.0-windows\win-x64\publish\TaskbarMeter.exe`
 self-contained / single-file なので、配布はこの exe 1 個で完結する。
 
+Git 管理下にある。壊したら `git checkout .` で戻せる。段階ごとにコミットすること。
+
 ## ファイル構成
 
 | ファイル | 内容 |
 |---|---|
-| `Program.cs` | 全実装。約 2100 行 |
+| `Program.cs` | 全実装。約 2400 行 |
 | `TaskbarMeter.csproj` | 配布設定（self-contained, PublishSingleFile） |
 | `build.cmd` | ビルド＆再起動用。日本語を含めない（文字コードで壊れた実績あり） |
 | `はじめかた.md` | 配布相手（初心者）向けのセットアップ手順 |
+| `README.md` | 開発者向けの概要 |
 
 ## アーキテクチャ
 
@@ -38,11 +41,35 @@ Program.Main
        ├ List<Metric>                     … 指標。1 指標 = 1 トレイアイコン
        ├ Dictionary<string, Slot>         … 有効な指標ぶんの NotifyIcon
        ├ IconFactory                      … アイコン画像の生成
+       ├ SetupForm                        … 初回セットアップ兼 設定画面
+       ├ TrayPromotion                    … Windows 11 のオーバーフロー対策
        ├ SessionRecorder / SessionResultForm … 計測とグラフ表示
        ├ PixelSkin / SkinPreviewForm      … 画像→アイコン変換
        ├ HotkeyWindow                     … Ctrl+Alt+M
        └ Settings                         … HKCU への保存
 ```
+
+### アイコン描画（IconFactory）
+
+**3 モードすべてが「16x16 の論理グリッド `char[][]` を組む → 実表示サイズに敷き詰める」**
+という同じ手順に乗っている。数字モードも `Glyphs`（5x9 のドット字形）を持っていて、
+GDI+ の文字描画は使っていない。
+
+- `BuildFace()` … キャラ。`Pair(y, x, c)` で左半分だけ書けば右は自動で折り返す
+- `BuildNumber()` … 数字。白ドットを置いて `Outline()` で 1 ドットの縁を付ける
+- `PaintGauge()` … 下 2 行（y=14,15）のゲージ。3 モード共通
+- `Render()` … グリッドを `SystemInformation.SmallIconSize` ちょうどに描いて Icon 化
+
+見た目を変えるときは基本ここだけ触ればよい。
+
+### 設定画面（SetupForm）
+
+初回起動の案内と、ふだんの設定を 1 枚で兼ねている。変更はその場で保存して
+`MeterContext.ReloadFromSettings()` を呼ぶので、選んでいる最中にトレイが変化する。
+
+右クリックメニューでも同じ設定ができるため、**両者のチェック状態がずれないように
+`_syncMenu`（各項目の同期処理を足し込んだ Action）と `_syncingMenu` ガードがある**。
+メニュー項目を増やすときは `_syncMenu +=` も足すこと。
 
 ### Metric（指標）
 
@@ -53,6 +80,10 @@ Program.Main
 
 `Read()` は `Sample(Ratio, Text, Tooltip, Value, Unit)` を返す。
 `Ratio` は 0〜1 でゲージ用、`Value` と `Unit` は記録・CSV 用の実値（% / GB / Mbps）。
+`Text` はアイコンに描く文字。`Glyphs` にある `0-9 . + -` しか描けないので注意。
+
+`ShortName` は設定画面など幅の狭い場所で使う名前。省略すると `Name` がそのまま使われるので、
+名前が長い指標のときだけ書けばよい。
 
 パフォーマンスカウンタ系は `CounterMetric` を継承すると、インスタンス列挙・張り替え・例外処理を任せられる。
 `Volatile => true` にすると、プロセス単位で入れ替わるインスタンス（GPU）に対応して定期的に張り替える。
@@ -80,6 +111,23 @@ Program.Main
 5. **GPU の深層学習負荷は 3D エンジンではなく Compute エンジンに出る**
    `engtype_3D` だけを見ていると学習中でも 0% に見える。`engtype_Compute` / `engtype_Cuda` を拾っている。
 
+6. **Windows 11 は初めて見るトレイアイコンをオーバーフロー（∧ の中）に入れる**
+   配布相手が exe をダブルクリックしても、タスクバーには何も出ない。**配布でいちばん
+   つまずくのはここ**。`TrayPromotion` が `HKCU\Control Panel\NotifyIconSettings` の
+   自分の exe のエントリに `IsPromoted=1` を書いて表に出す（管理者権限は不要）。
+   Windows 10 にはこのキーが無いので、その場合は手動手順を画面に出している。
+   このエントリは**一度アイコンを表示しないと作られない**ため、起動直後には呼べない。
+
+7. **高負荷を「本体の色を赤に寄せて」表すと、指標の見分けがつかなくなる**
+   青×サーモンは灰色、ミント×サーモンは茶色になり、100% でどの指標も同じ色に潰れた。
+   一番「どれが限界か」を知りたい瞬間に使えなくなる。**本体は指標の色を保ち、
+   危険はゲージの赤（`PaintGauge` の `'H'`）と表情で伝える**方式にしてある。
+
+8. **モーダルは `Application.Run` が始まってから開く**
+   `MeterContext` のコンストラクタはメッセージループの前に走るので、そこで `ShowDialog()`
+   すると不安定になる。初回セットアップは `_pendingSetup` フラグを立てて、
+   最初のタイマー tick で開いている。
+
 ## 設定の保存先
 
 - `HKEY_CURRENT_USER\Software\TaskbarMeter` … 表示モード、しきい値、見た目、指標ごとの ON/OFF と色
@@ -90,9 +138,10 @@ Program.Main
 
 ## 実装済みの機能
 
+- **初回セットアップ画面**（表示する項目 / 見た目 / タスクバーに出す / 自動起動）。設定画面も兼ねる
 - 表示モード（常に表示 / 高負荷のときだけ表示 + しきい値）
 - 指標の選択、指標ごとの色変更（ColorDialog）
-- 見た目の切り替え（数字のみ / 内蔵ドット絵キャラ / 画像から作ったドット絵）
+- 見た目の切り替え（数字 / 内蔵ドット絵キャラ / 画像から作ったドット絵）
 - 内蔵キャラは負荷で 5 段階に表情が変化（うとうと・ふつう・ごきげん・あせり・限界）＋まばたき
 - 画像→アイコン変換（解像度 16〜64、背景の自動透明化、ポスタライズ、なめらか表示）
 - 計測セッション（開始/停止 → 折れ線グラフ + 平均/最大/最小 + CSV 保存）
@@ -102,7 +151,7 @@ Program.Main
 ## 今後の候補（未着手）
 
 - アイコン同士の掛け合い（隣のアイコンの負荷を見て表情が変わる）。差別化の目玉として案が出ている
-- スキン切り替え（内蔵キャラを猫・スライムなどに）
+- スキン切り替え（内蔵キャラを猫・スライムなどに）。`BaseSprite` と `BuildFace` を差し替え可能にする形が素直
 - プロセス指定モニター（`pid_xxx` インスタンスで python.exe の GPU/VRAM だけ見る）
 - VRAM 逼迫アラート
 - 高負荷時の微アニメーション（震える・跳ねる）
@@ -112,5 +161,20 @@ Program.Main
 
 - コメントは日本語。「なぜそうしたか」を書く（何をしているかはコードを読めば分かる）
 - 作者は C# 初心者寄り。大きな変更をするときは、何をどう変えたかを説明すること
-- 変更後は `build.cmd` でビルドが通ることを確認してもらう（この環境ではビルドできない場合がある）
 - 機能を盛りすぎない方針。見た目と、研究用途に効く機能を優先する
+
+### 見た目を変えたときの確認方法
+
+**アイコンはコードを読んでも良し悪しが分からない。必ず描いて目で見ること。**
+`IconFactory` は internal なので、`Program.cs` をリンクして `StartupObject` を差し替えた
+使い捨てプロジェクトを作れば、本体を汚さずに呼び出せる。
+
+```xml
+<Compile Include="C:\Users\Shion\TaskbarMeter\Program.cs" Link="Program.cs" />
+<StartupObject>IconSheet.Entry</StartupObject>
+```
+
+`IconFactory.Create(...)` の結果を `Icon.ToBitmap()` して最近傍で 8 倍に拡大し、
+負荷（5 / 35 / 65 / 90 / 100%）× モード × 色 の一覧を PNG に吐くと判断しやすい。
+`SetupForm` も `form.Show()` → `DrawToBitmap()` で画像にできる。
+この方法で「100% で全色が同じ赤に潰れる」「`99+` が読めない字になる」を見つけた。
