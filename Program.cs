@@ -1926,6 +1926,12 @@ internal sealed class SetupForm : Form
     private readonly List<Panel> _previews = new();
     private bool _syncing;
 
+    /// <summary>
+    /// 本文。画面の縦が足りない環境ではここだけスクロールさせ、
+    /// 下のボタンは必ず見えるようにする（1366x768 のノートで押せなくなるのを防ぐ）。
+    /// </summary>
+    private readonly Panel _body = new() { AutoScroll = true };
+
     public SetupForm(List<Metric> metrics, bool firstRun, Action apply,
                      Func<PixelSkin?> skin, Action chooseImage)
     {
@@ -1944,21 +1950,36 @@ internal sealed class SetupForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
 
+        const int width = 528;
+        const int barHeight = 62;
+
+        _body.BackColor = Back;
+        Controls.Add(_body);
+
         int y = Gutter;
         y = BuildHeader(y, firstRun);
         y = BuildMetricSection(y);
         y = BuildStyleSection(y);
         y = BuildTaskbarSection(y);
-        y = BuildFooter(y, firstRun);
+        y = BuildOptions(y);
+        int content = y + Gutter;
 
-        ClientSize = new Size(528, y + Gutter);
+        // 入りきらなければ本文を縮めてスクロールさせる。ドッキングは並び順で
+        // 挙動が変わって分かりにくいので、位置は明示的に置いている。
+        int room = (Screen.FromPoint(Cursor.Position)?.WorkingArea.Height ?? 900) - 120 - barHeight;
+        int bodyHeight = Math.Max(320, Math.Min(content, room));
+
+        _body.Bounds = new Rectangle(0, 0, width, bodyHeight);
+        Controls.Add(BuildButtonBar(firstRun, width, bodyHeight, barHeight));
+
+        ClientSize = new Size(width, bodyHeight + barHeight);
     }
 
     // ----- 見出し ---------------------------------------------------------
 
     private int BuildHeader(int y, bool firstRun)
     {
-        Controls.Add(new Label
+        _body.Controls.Add(new Label
         {
             Text = "TaskbarMeter",
             Font = new Font("Yu Gothic UI", 16f, FontStyle.Bold),
@@ -1968,10 +1989,10 @@ internal sealed class SetupForm : Form
         });
         y += 32;
 
-        Controls.Add(new Label
+        _body.Controls.Add(new Label
         {
             Text = firstRun
-                ? "タスクバーの右下に、CPU や GPU の使用率を住まわせます。\n下の 3 つを決めるだけで使いはじめられます。"
+                ? "タスクバーの右下に、CPU や GPU の使用率を住まわせます。\n下の 4 つを決めるだけで使いはじめられます。"
                 : "設定はすぐに反映されます。閉じるボタンで終わりです。",
             ForeColor = Faint,
             AutoSize = false,
@@ -1983,7 +2004,7 @@ internal sealed class SetupForm : Form
 
     private int SectionTitle(int y, string text)
     {
-        Controls.Add(new Label
+        _body.Controls.Add(new Label
         {
             Text = text,
             Font = new Font("Yu Gothic UI", 10.5f, FontStyle.Bold),
@@ -2018,7 +2039,7 @@ internal sealed class SetupForm : Form
             };
             preview.Paint += (_, e) => DrawPreview(e.Graphics, preview.ClientRectangle, 0.45, "45",
                                                    Settings.MetricColor(metric.Id, metric.DefaultColor));
-            Controls.Add(preview);
+            _body.Controls.Add(preview);
             _previews.Add(preview);
 
             var box = new CheckBox
@@ -2031,7 +2052,7 @@ internal sealed class SetupForm : Form
                 Tag = metric
             };
             box.CheckedChanged += (_, _) => OnMetricToggled(box, metric);
-            Controls.Add(box);
+            _body.Controls.Add(box);
             _metricBoxes.Add(box);
         }
 
@@ -2107,7 +2128,7 @@ internal sealed class SetupForm : Form
                     DrawPreview(e.Graphics, box, samples[i], texts[i], color, captured);
                 }
             };
-            Controls.Add(strip);
+            _body.Controls.Add(strip);
             _previews.Add(strip);
 
             var radio = new RadioButton
@@ -2138,10 +2159,10 @@ internal sealed class SetupForm : Form
                 _apply();
                 RefreshPreviews();
             };
-            Controls.Add(radio);
+            _body.Controls.Add(radio);
             buttons.Add((captured, radio));
 
-            Controls.Add(new Label
+            _body.Controls.Add(new Label
             {
                 Text = note,
                 ForeColor = Faint,
@@ -2159,7 +2180,7 @@ internal sealed class SetupForm : Form
             Bounds = new Rectangle(Gutter, y, 150, 28)
         };
         change.Click += (_, _) => { _chooseImage(); RefreshPreviews(); };
-        Controls.Add(change);
+        _body.Controls.Add(change);
 
         return y + 40;
     }
@@ -2170,7 +2191,7 @@ internal sealed class SetupForm : Form
     {
         y = SectionTitle(y, "③ タスクバーに出す");
 
-        Controls.Add(new Label
+        _body.Controls.Add(new Label
         {
             Text = "Windows 11 は新しいアイコンを、最初は「∧」ボタンの中に隠します。\n" +
                    "下のボタンで表に出せます。",
@@ -2208,11 +2229,11 @@ internal sealed class SetupForm : Form
             result.ForeColor = ok ? Color.FromArgb(130, 230, 160) : Color.FromArgb(255, 190, 120);
             result.Text = ok ? "出しました。" : "うまくいきませんでした。下の手順でどうぞ。";
         };
-        Controls.Add(button);
-        Controls.Add(result);
+        _body.Controls.Add(button);
+        _body.Controls.Add(result);
         y += 36;
 
-        Controls.Add(new Label
+        _body.Controls.Add(new Label
         {
             Text = "うまくいかないときは、タスクバー右下の「∧」を押して、\n" +
                    "出てきたアイコンをタスクバーへドラッグしてください。",
@@ -2226,7 +2247,7 @@ internal sealed class SetupForm : Form
 
     // ----- 下段 -----------------------------------------------------------
 
-    private int BuildFooter(int y, bool firstRun)
+    private int BuildOptions(int y)
     {
         y = SectionTitle(y, "④ 見失わないために");
 
@@ -2255,7 +2276,7 @@ internal sealed class SetupForm : Form
                 "exe の場所をメモしておくか、右クリックで「送る」→「デスクトップ」を使ってください。",
                 "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         };
-        Controls.Add(startMenu);
+        _body.Controls.Add(startMenu);
         y += 28;
 
         var autoStart = new CheckBox
@@ -2271,21 +2292,38 @@ internal sealed class SetupForm : Form
             if (_syncing) return;
             AutoStart.Set(autoStart.Checked);
         };
-        Controls.Add(autoStart);
-        y += 34;
+        _body.Controls.Add(autoStart);
+
+        return y + 30;
+    }
+
+    /// <summary>本文の下に固定する帯。スクロールしてもボタンが隠れないようにする。</summary>
+    private Control BuildButtonBar(bool firstRun, int width, int top, int height)
+    {
+        var bar = new Panel
+        {
+            Bounds = new Rectangle(0, top, width, height),
+            BackColor = Card
+        };
+        // 本文との境目。スクロールしたときに帯が浮いて見えるように 1 本引く
+        bar.Paint += (_, e) =>
+        {
+            using var line = new Pen(Color.FromArgb(70, 70, 80));
+            e.Graphics.DrawLine(line, 0, 0, width, 0);
+        };
 
         var close = new Button
         {
             Text = firstRun ? "使いはじめる" : "閉じる",
             DialogResult = DialogResult.OK,
             FlatStyle = FlatStyle.System,
-            Bounds = new Rectangle(528 - Gutter - 130, y, 130, 32)
+            Bounds = new Rectangle(width - Gutter - 130, (height - 32) / 2, 130, 32)
         };
-        Controls.Add(close);
+        bar.Controls.Add(close);
         AcceptButton = close;
         CancelButton = close;
 
-        return y + 38;
+        return bar;
     }
 
     // ----- プレビュー -----------------------------------------------------

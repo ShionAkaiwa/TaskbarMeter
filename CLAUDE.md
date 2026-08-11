@@ -189,5 +189,17 @@ GDI+ の文字描画は使っていない。
 
 `IconFactory.Create(...)` の結果を `Icon.ToBitmap()` して最近傍で 8 倍に拡大し、
 負荷（5 / 35 / 65 / 90 / 100%）× モード × 色 の一覧を PNG に吐くと判断しやすい。
-`SetupForm` も `form.Show()` → `DrawToBitmap()` で画像にできる。
 この方法で「100% で全色が同じ赤に潰れる」「`99+` が読めない字になる」を見つけた。
+
+**フォームの確認に `DrawToBitmap()` を使わないこと。** 入れ子パネル（`SetupForm._body` と
+ボタン帯）の位置を取り違えて描き、実際には収まっているボタンが切れて見える。
+実際に `Show()` してから `Graphics.CopyFromScreen` で画面のピクセルを撮ること。
+
+```csharp
+form.Location = new Point(40, 20);
+form.Show(); form.Activate();
+for (int i = 0; i < 40; i++) { Application.DoEvents(); Thread.Sleep(25); }
+Point origin = form.PointToScreen(Point.Empty);
+using var g = Graphics.FromImage(bmp);
+g.CopyFromScreen(origin, Point.Empty, form.ClientSize);
+```
