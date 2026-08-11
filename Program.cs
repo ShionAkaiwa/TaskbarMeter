@@ -88,6 +88,14 @@ internal sealed class MeterContext : ApplicationContext
     private int _threshold = Settings.Threshold;
     private IconStyle _style = Settings.Style;
 
+    // 設定画面で変えた内容をメニューのチェックに反映するための集約。
+    // 反映中に CheckedChanged が走ると設定を上書きしてしまうので _syncingMenu で止める。
+    private Action _syncMenu = () => { };
+    private bool _syncingMenu;
+
+    /// <summary>初回セットアップをまだ出していないか。最初のタイマー tick で開く。</summary>
+    private bool _pendingSetup;
+
     private bool _forceShow;
     private bool _forceHide;
     private int _cooldown;
@@ -104,7 +112,18 @@ internal sealed class MeterContext : ApplicationContext
         _hotkey.Pressed += ToggleVisibility;
 
         _timer.Interval = 1000;
-        _timer.Tick += (_, _) => Update();
+        _timer.Tick += (_, _) =>
+        {
+            Update();
+
+            // 初回セットアップはここで開く。コンストラクタ（= Application.Run の前）で
+            // モーダルを出すと動作が不安定なので、メッセージループが回り始めてからにする。
+            // アイコンが 1 秒ぶん表示済みになるため、「タスクバーに出す」が参照する
+            // レジストリのエントリが用意できている、という意味でも都合がよい。
+            if (!_pendingSetup) return;
+            _pendingSetup = false;
+            ShowSetup(firstRun: true);
+        };
         _timer.Start();
         Update();
 
@@ -115,6 +134,8 @@ internal sealed class MeterContext : ApplicationContext
             Notify("Ctrl+Alt+M が他のアプリと競合しており登録できませんでした。" +
                    "「高負荷のときだけ表示」は無効にしています。", ToolTipIcon.Warning);
         }
+
+        _pendingSetup = !Settings.SetupDone;
     }
 
     // ----- メニュー -------------------------------------------------------
@@ -122,6 +143,15 @@ internal sealed class MeterContext : ApplicationContext
     private void BuildMenu()
     {
         _menu = new ContextMenuStrip();
+
+        // 迷ったらここ、という入口を先頭に置く
+        var setup = new ToolStripMenuItem("設定…")
+        {
+            Font = new Font(_menu.Font, FontStyle.Bold)
+        };
+        setup.Click += (_, _) => ShowSetup(firstRun: false);
+        _menu.Items.Add(setup);
+        _menu.Items.Add(new ToolStripSeparator());
 
         _alwaysItem.Click += (_, _) => SetMode(DisplayMode.Always);
         _autoItem.Click += (_, _) => SetMode(DisplayMode.Auto);
@@ -151,7 +181,12 @@ internal sealed class MeterContext : ApplicationContext
             CheckOnClick = true,
             Checked = AutoStart.IsEnabled
         };
-        autoStart.CheckedChanged += (_, _) => AutoStart.Set(autoStart.Checked);
+        autoStart.CheckedChanged += (_, _) =>
+        {
+            if (_syncingMenu) return;
+            AutoStart.Set(autoStart.Checked);
+        };
+        _syncMenu += () => autoStart.Checked = AutoStart.IsEnabled;
         _menu.Items.Add(autoStart);
 
         var taskManager = new ToolStripMenuItem("タスク マネージャーを開く");
@@ -204,6 +239,8 @@ internal sealed class MeterContext : ApplicationContext
             };
             item.CheckedChanged += (_, _) =>
             {
+                if (_syncingMenu) return;
+
                 // 全部消すとメニューに触れなくなるので、最後の1つは外させない
                 if (!item.Checked && _slots.Count <= 1)
                 {
@@ -215,6 +252,8 @@ internal sealed class MeterContext : ApplicationContext
                 SyncSlots();
                 Update();
             };
+            _syncMenu += () => item.Checked =
+                Settings.MetricEnabled(captured.Id, captured.DefaultEnabled);
             root.DropDownItems.Add(item);
         }
         return root;
@@ -295,8 +334,44 @@ internal sealed class MeterContext : ApplicationContext
         root.DropDownItems.Add(new ToolStripSeparator());
         root.DropDownItems.Add(choose);
 
+        _syncMenu += RefreshChecks;
         RefreshChecks();
         return root;
+    }
+
+    // ----- 設定画面 -------------------------------------------------------
+
+    /// <summary>
+    /// セットアップ／設定画面を開く。変更はその場で保存されるので、
+    /// 閉じたあとに常駐側の状態を設定から読み直して合わせる。
+    /// </summary>
+    private void ShowSetup(bool firstRun)
+    {
+        using var form = new SetupForm(_metrics, firstRun, ReloadFromSettings,
+                                       () => _skin, ChooseImage);
+        form.ShowDialog();
+
+        Settings.SetupDone = true;
+        ReloadFromSettings();
+    }
+
+    /// <summary>設定画面で変わった内容を常駐側に反映する。</summary>
+    private void ReloadFromSettings()
+    {
+        _mode = Settings.Mode;
+        _threshold = Settings.Threshold;
+        _style = Settings.Style;
+        _skinSmooth = Settings.SkinSmooth;
+        if (_style == IconStyle.Image && _skin is null) _skin = PixelSkin.LoadSaved();
+
+        SyncSlots();
+        RefreshModeChecks();
+
+        _syncingMenu = true;
+        try { _syncMenu(); }
+        finally { _syncingMenu = false; }
+
+        Update();
     }
 
     /// <summary>画像を選び、ドット絵に変換してプレビューし、採用されたら保存する。</summary>
@@ -584,6 +659,12 @@ internal abstract class Metric : IDisposable
     public abstract Color DefaultColor { get; }
     public virtual bool DefaultEnabled => false;
 
+    /// <summary>
+    /// 設定画面の一覧など、幅が限られる場所で使う短い名前。
+    /// 名前が長くない指標は何も書かなくてよい（既定で Name をそのまま使う）。
+    /// </summary>
+    public virtual string ShortName => Name;
+
     /// <summary>数秒に一度呼ばれる。カウンタの張り替えが必要な指標だけ実装する。</summary>
     public virtual void Refresh() { }
 
@@ -798,6 +879,7 @@ internal sealed class GpuComputeMetric : CounterMetric
 {
     public override string Id => "gpucompute";
     public override string Name => "GPU 使用率 (Compute / 学習)";
+    public override string ShortName => "GPU 使用率 (学習)";
     public override Color DefaultColor => Color.FromArgb(232, 150, 60);
 
     protected override string CategoryEnglish => "GPU Engine";
@@ -1744,6 +1826,386 @@ internal sealed class SkinPreviewForm : Form
 }
 
 // ---------------------------------------------------------------------------
+//  セットアップ / 設定
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// 初回起動の案内と、ふだんの設定を兼ねる 1 枚の画面。
+/// 右クリックメニューでも同じことはできるが、初めての人にメニューを探させないために、
+/// 「表示する項目・見た目・タスクバーに出す・自動起動」をここに集めてある。
+///
+/// 変更はその場で保存して apply を呼ぶので、トレイのアイコンが即座に変わる。
+/// 自分がいま何を設定しているのかが目で見て分かるようにするため。
+/// </summary>
+internal sealed class SetupForm : Form
+{
+    private static readonly Color Back = Color.FromArgb(30, 30, 36);
+    private static readonly Color Card = Color.FromArgb(42, 42, 50);
+    private static readonly Color Faint = Color.FromArgb(175, 255, 255, 255);
+    private static readonly Color Accent = Color.FromArgb(120, 200, 255);
+
+    private const int Gutter = 24;
+    private const int Swatch = 32;   // プレビューアイコンの一辺
+
+    private readonly List<Metric> _metrics;
+    private readonly Action _apply;
+    private readonly Func<PixelSkin?> _skin;
+    private readonly Action _chooseImage;
+
+    private readonly List<CheckBox> _metricBoxes = new();
+    private readonly List<Panel> _previews = new();
+    private bool _syncing;
+
+    public SetupForm(List<Metric> metrics, bool firstRun, Action apply,
+                     Func<PixelSkin?> skin, Action chooseImage)
+    {
+        _metrics = metrics;
+        _apply = apply;
+        _skin = skin;
+        _chooseImage = chooseImage;
+
+        Text = firstRun ? "TaskbarMeter へようこそ" : "TaskbarMeter の設定";
+        BackColor = Back;
+        ForeColor = Color.White;
+        Font = new Font("Yu Gothic UI", 9.5f);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        ShowInTaskbar = true;
+
+        int y = Gutter;
+        y = BuildHeader(y, firstRun);
+        y = BuildMetricSection(y);
+        y = BuildStyleSection(y);
+        y = BuildTaskbarSection(y);
+        y = BuildFooter(y, firstRun);
+
+        ClientSize = new Size(528, y + Gutter);
+    }
+
+    // ----- 見出し ---------------------------------------------------------
+
+    private int BuildHeader(int y, bool firstRun)
+    {
+        Controls.Add(new Label
+        {
+            Text = "TaskbarMeter",
+            Font = new Font("Yu Gothic UI", 16f, FontStyle.Bold),
+            ForeColor = Color.White,
+            AutoSize = true,
+            Location = new Point(Gutter, y)
+        });
+        y += 32;
+
+        Controls.Add(new Label
+        {
+            Text = firstRun
+                ? "タスクバーの右下に、CPU や GPU の使用率を住まわせます。\n下の 3 つを決めるだけで使いはじめられます。"
+                : "設定はすぐに反映されます。閉じるボタンで終わりです。",
+            ForeColor = Faint,
+            AutoSize = false,
+            Size = new Size(470, 40),
+            Location = new Point(Gutter, y)
+        });
+        return y + 48;
+    }
+
+    private int SectionTitle(int y, string text)
+    {
+        Controls.Add(new Label
+        {
+            Text = text,
+            Font = new Font("Yu Gothic UI", 10.5f, FontStyle.Bold),
+            ForeColor = Accent,
+            AutoSize = true,
+            Location = new Point(Gutter, y)
+        });
+        return y + 26;
+    }
+
+    // ----- ① 表示する項目 -------------------------------------------------
+
+    private int BuildMetricSection(int y)
+    {
+        y = SectionTitle(y, "① 表示する項目");
+
+        // 2 列に並べる。8 項目を縦一列にすると画面が長くなりすぎるため。
+        const int colWidth = 240;
+        int rows = (_metrics.Count + 1) / 2;
+
+        for (int i = 0; i < _metrics.Count; i++)
+        {
+            Metric metric = _metrics[i];
+            int col = i / rows, row = i % rows;
+            int x = Gutter + col * colWidth;
+            int top = y + row * 30;
+
+            var preview = new Panel
+            {
+                Bounds = new Rectangle(x, top, Swatch, Swatch),
+                BackColor = Card
+            };
+            preview.Paint += (_, e) => DrawPreview(e.Graphics, preview.ClientRectangle, 0.45, "45",
+                                                   Settings.MetricColor(metric.Id, metric.DefaultColor));
+            Controls.Add(preview);
+            _previews.Add(preview);
+
+            var box = new CheckBox
+            {
+                Text = metric.ShortName,
+                Checked = Settings.MetricEnabled(metric.Id, metric.DefaultEnabled),
+                ForeColor = Color.White,
+                AutoSize = false,
+                Bounds = new Rectangle(x + Swatch + 8, top + 6, colWidth - Swatch - 16, 22),
+                Tag = metric
+            };
+            box.CheckedChanged += (_, _) => OnMetricToggled(box, metric);
+            Controls.Add(box);
+            _metricBoxes.Add(box);
+        }
+
+        return y + rows * 30 + 10;
+    }
+
+    private void OnMetricToggled(CheckBox box, Metric metric)
+    {
+        if (_syncing) return;
+
+        // 全部消すと右クリックする先が無くなり、設定に戻れなくなる
+        if (!box.Checked && _metricBoxes.Count(b => b.Checked) == 0)
+        {
+            _syncing = true;
+            box.Checked = true;
+            _syncing = false;
+            MessageBox.Show(this,
+                "最低 1 つは表示したままにしてください。\n" +
+                "アイコンが 1 つも無くなると、右クリックで設定を開けなくなります。",
+                "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        Settings.SetMetricEnabled(metric.Id, box.Checked);
+        _apply();
+    }
+
+    // ----- ② 見た目 -------------------------------------------------------
+
+    private int BuildStyleSection(int y)
+    {
+        y = SectionTitle(y, "② 見た目");
+
+        var choices = new (IconStyle Style, string Label, string Note)[]
+        {
+            (IconStyle.Face, "ドット絵キャラ", "負荷で表情が変わります"),
+            (IconStyle.Number, "数字", "使用率をそのまま数字で"),
+            (IconStyle.Image, "好きな画像", "画像をドット絵に変換します")
+        };
+
+        var buttons = new List<RadioButton>();
+
+        foreach ((IconStyle style, string label, string note) in choices)
+        {
+            IconStyle captured = style;
+            int top = y;
+
+            // 低・中・高の 3 つを並べる。負荷で見た目が変わることを言葉より早く伝えられる。
+            var strip = new Panel
+            {
+                Bounds = new Rectangle(Gutter, top, Swatch * 3 + 16, Swatch),
+                BackColor = Card
+            };
+            strip.Paint += (_, e) =>
+            {
+                Color color = _metrics[0].DefaultColor;
+                double[] samples = { 0.15, 0.55, 0.95 };
+                string[] texts = { "15", "55", "95" };
+                for (int i = 0; i < 3; i++)
+                {
+                    var box = new Rectangle(4 + i * (Swatch + 4), 0, Swatch, Swatch);
+                    DrawPreview(e.Graphics, box, samples[i], texts[i], color, captured);
+                }
+            };
+            Controls.Add(strip);
+            _previews.Add(strip);
+
+            var radio = new RadioButton
+            {
+                Text = label,
+                Checked = Settings.Style == captured,
+                ForeColor = Color.White,
+                AutoSize = false,
+                Bounds = new Rectangle(strip.Right + 12, top + 1, 200, 20)
+            };
+            radio.CheckedChanged += (_, _) =>
+            {
+                if (_syncing || !radio.Checked) return;
+
+                // 画像がまだ無いのに「好きな画像」を選ばれたら、先に画像を作ってもらう
+                if (captured == IconStyle.Image && _skin() is null)
+                {
+                    _chooseImage();
+                    if (_skin() is null)
+                    {
+                        _syncing = true;
+                        radio.Checked = false;
+                        buttons.First(b => b.Text == "ドット絵キャラ").Checked = true;
+                        _syncing = false;
+                        return;
+                    }
+                }
+
+                Settings.Style = captured;
+                _apply();
+                RefreshPreviews();
+            };
+            Controls.Add(radio);
+            buttons.Add(radio);
+
+            Controls.Add(new Label
+            {
+                Text = note,
+                ForeColor = Faint,
+                AutoSize = false,
+                Bounds = new Rectangle(strip.Right + 12, top + 19, 220, 18)
+            });
+
+            y += Swatch + 10;
+        }
+
+        var change = new Button
+        {
+            Text = "画像を選び直す…",
+            FlatStyle = FlatStyle.System,
+            Bounds = new Rectangle(Gutter, y, 150, 28)
+        };
+        change.Click += (_, _) => { _chooseImage(); RefreshPreviews(); };
+        Controls.Add(change);
+
+        return y + 40;
+    }
+
+    // ----- ③ タスクバーに出す ---------------------------------------------
+
+    private int BuildTaskbarSection(int y)
+    {
+        y = SectionTitle(y, "③ タスクバーに出す");
+
+        Controls.Add(new Label
+        {
+            Text = "Windows 11 は新しいアイコンを、最初は「∧」ボタンの中に隠します。\n" +
+                   "下のボタンで表に出せます。",
+            ForeColor = Faint,
+            AutoSize = false,
+            Size = new Size(470, 36),
+            Location = new Point(Gutter, y)
+        });
+        y += 40;
+
+        var button = new Button
+        {
+            Text = "タスクバーに出す",
+            FlatStyle = FlatStyle.System,
+            Bounds = new Rectangle(Gutter, y, 150, 30),
+            Enabled = TrayPromotion.Supported
+        };
+
+        var result = new Label
+        {
+            Text = TrayPromotion.Supported
+                ? ""
+                : "この Windows では手動で出してください（下の説明）。",
+            ForeColor = Faint,
+            AutoSize = false,
+            Bounds = new Rectangle(Gutter + 162, y + 6, 260, 20)
+        };
+
+        button.Click += (_, _) =>
+        {
+            bool ok = TrayPromotion.Promote();
+            _apply();
+            result.ForeColor = ok ? Color.FromArgb(130, 230, 160) : Color.FromArgb(255, 190, 120);
+            result.Text = ok ? "出しました。" : "うまくいきませんでした。下の手順でどうぞ。";
+        };
+        Controls.Add(button);
+        Controls.Add(result);
+        y += 36;
+
+        Controls.Add(new Label
+        {
+            Text = "うまくいかないときは、タスクバー右下の「∧」を押して、\n" +
+                   "出てきたアイコンをタスクバーへドラッグしてください。",
+            ForeColor = Faint,
+            AutoSize = false,
+            Size = new Size(470, 36),
+            Location = new Point(Gutter, y)
+        });
+        return y + 44;
+    }
+
+    // ----- 下段 -----------------------------------------------------------
+
+    private int BuildFooter(int y, bool firstRun)
+    {
+        var autoStart = new CheckBox
+        {
+            Text = "Windows を起動したら自動で始める",
+            Checked = AutoStart.IsEnabled,
+            ForeColor = Color.White,
+            AutoSize = false,
+            Bounds = new Rectangle(Gutter, y, 300, 24)
+        };
+        autoStart.CheckedChanged += (_, _) =>
+        {
+            if (_syncing) return;
+            AutoStart.Set(autoStart.Checked);
+        };
+        Controls.Add(autoStart);
+
+        var close = new Button
+        {
+            Text = firstRun ? "使いはじめる" : "閉じる",
+            DialogResult = DialogResult.OK,
+            FlatStyle = FlatStyle.System,
+            Bounds = new Rectangle(528 - Gutter - 130, y - 4, 130, 32)
+        };
+        Controls.Add(close);
+        AcceptButton = close;
+        CancelButton = close;
+
+        return y + 34;
+    }
+
+    // ----- プレビュー -----------------------------------------------------
+
+    private void RefreshPreviews()
+    {
+        foreach (Panel panel in _previews) panel.Invalidate();
+    }
+
+    private void DrawPreview(Graphics g, Rectangle box, double ratio, string text, Color color)
+        => DrawPreview(g, box, ratio, text, color, Settings.Style);
+
+    private void DrawPreview(Graphics g, Rectangle box, double ratio, string text,
+                             Color color, IconStyle style)
+    {
+        PixelSkin? skin = _skin();
+        if (style == IconStyle.Image && skin is null) style = IconStyle.Face;
+
+        using Icon icon = IconFactory.Create(ratio, text, color, style,
+                                             blink: false, recording: false,
+                                             skin: skin, smoothSkin: Settings.SkinSmooth);
+        using Bitmap bmp = icon.ToBitmap();
+
+        // ドットを潰さずに拡大したいので最近傍で引き伸ばす
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        g.SmoothingMode = SmoothingMode.None;
+        g.DrawImage(bmp, box);
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  計測セッション
 // ---------------------------------------------------------------------------
 
@@ -2188,6 +2650,13 @@ internal static class Settings
         set => Write("HintShown", value ? 1 : 0);
     }
 
+    /// <summary>初回セットアップを一度でも終えたか。初めての起動を見分けるために使う。</summary>
+    public static bool SetupDone
+    {
+        get => Read("SetupDone", 0) == 1;
+        set => Write("SetupDone", value ? 1 : 0);
+    }
+
     public static bool MetricEnabled(string id, bool fallback)
         => Read($"Metric_{id}_On", fallback ? 1 : 0) == 1;
 
@@ -2231,6 +2700,67 @@ internal static class Settings
             key?.SetValue(name, value, RegistryValueKind.DWord);
         }
         catch { /* 保存できなくても動作は続ける */ }
+    }
+}
+
+/// <summary>
+/// Windows 11 は「初めて見るトレイアイコン」を既定でオーバーフロー（∧ ボタンの中）へ入れる。
+/// 配布相手が exe をダブルクリックしても、タスクバーには何も出ないので「動いてない」と思われる。
+/// ここが配布でいちばんつまずく場所なので、表に出すための操作を用意しておく。
+///
+/// Windows 11 は自分のアイコンの表示設定を HKCU\Control Panel\NotifyIconSettings に持っていて、
+/// IsPromoted=1 で「タスクバーに出す」になる。HKCU なので管理者権限は要らない。
+/// Windows 10 にはこのキーが無いため、その場合は何もせず false を返す（案内は画面側で出す）。
+/// </summary>
+internal static class TrayPromotion
+{
+    private const string Key = @"Control Panel\NotifyIconSettings";
+
+    /// <summary>この Windows が「表に出す」設定を持っているか。</summary>
+    public static bool Supported
+    {
+        get
+        {
+            try
+            {
+                using RegistryKey? root = Registry.CurrentUser.OpenSubKey(Key);
+                return root is not null;
+            }
+            catch { return false; }
+        }
+    }
+
+    /// <summary>
+    /// 自分の exe が出しているアイコンをすべて「タスクバーに出す」にする。
+    /// エントリは一度アイコンを表示しないと作られないので、常駐開始後に呼ぶこと。
+    /// </summary>
+    public static bool Promote()
+    {
+        try
+        {
+            string? exe = Environment.ProcessPath;
+            if (exe is null) return false;
+
+            using RegistryKey? root = Registry.CurrentUser.OpenSubKey(Key, writable: true);
+            if (root is null) return false;
+
+            bool promoted = false;
+            foreach (string name in root.GetSubKeyNames())
+            {
+                try
+                {
+                    using RegistryKey? entry = root.OpenSubKey(name, writable: true);
+                    if (entry?.GetValue("ExecutablePath") is not string path) continue;
+                    if (!string.Equals(path, exe, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    entry.SetValue("IsPromoted", 1, RegistryValueKind.DWord);
+                    promoted = true;
+                }
+                catch { /* 個別のエントリが読めなくても他を試す */ }
+            }
+            return promoted;
+        }
+        catch { return false; }
     }
 }
 
