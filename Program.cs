@@ -936,32 +936,64 @@ internal sealed class NetworkMetric : CounterMetric
 // ---------------------------------------------------------------------------
 
 /// <summary>
-/// アイコンを描く。ドット絵モードは実際のトレイサイズに 16x16 のドットを
-/// 等倍で敷き詰めるので、縮小によるボケが起きない。
+/// アイコンを描く。
+///
+/// どのモードも「16x16 の論理グリッドを組んでから、トレイの実表示サイズちょうどに
+/// 敷き詰める」という同じ手順で描く。表示サイズは DPI 依存（100%=16px, 150%=24px,
+/// 200%=32px）で、大きく描いて Windows に縮小させるとボケるため、必ず実寸で描く。
+/// 数字モードも専用のドット字形を持たせてこの仕組みに乗せてある。
 /// </summary>
 internal static class IconFactory
 {
+    private const int G = 16;         // 論理グリッドの一辺
+    private const int GaugeTop = 14;  // 下 2 行はゲージ
+
     private static readonly Color HotTone = Color.FromArgb(255, 96, 72);
 
-    /// <summary>ドット絵の下地。C=本体色 / #=輪郭 / .=透明。下2行はゲージ用の余白。</summary>
+    /// <summary>
+    /// ドット絵キャラの下地。
+    /// L=上のハイライト / C=本体色 / c=下の陰 / #=輪郭 / .=透明。
+    /// 上を明るく下を暗くしておくと、16px でも平たい丸ではなく球体に見える。
+    /// </summary>
     private static readonly string[] BaseSprite =
     {
         ".....######.....",
-        "...##CCCCCC##...",
-        "..#CCCCCCCCCC#..",
-        ".#CCCCCCCCCCCC#.",
+        "...##LLLLLL##...",
+        "..#LLLLLLLLLL#..",
+        ".#LLLLLLLLLLLL#.",
         ".#CCCCCCCCCCCC#.",
         "#CCCCCCCCCCCCCC#",
         "#CCCCCCCCCCCCCC#",
         "#CCCCCCCCCCCCCC#",
         "#CCCCCCCCCCCCCC#",
         ".#CCCCCCCCCCCC#.",
-        ".#CCCCCCCCCCCC#.",
-        "..#CCCCCCCCCC#..",
-        "...##CCCCCC##...",
+        ".#cccccccccccc#.",
+        "..#cccccccccc#..",
+        "...##cccccc##...",
         ".....######.....",
         "................",
         "................"
+    };
+
+    /// <summary>
+    /// 数字モード用のドット字形。数字は 5x9、記号は細身にしてある。
+    /// 16px の中に 3 文字（"9.9" や "99+"）まで収めるための幅配分。
+    /// </summary>
+    private static readonly Dictionary<char, string[]> Glyphs = new()
+    {
+        ['0'] = new[] { ".###.", "#...#", "#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###." },
+        ['1'] = new[] { "..#..", ".##..", "#.#..", "..#..", "..#..", "..#..", "..#..", "..#..", ".###." },
+        ['2'] = new[] { ".###.", "#...#", "....#", "....#", "...#.", "..#..", ".#...", "#....", "#####" },
+        ['3'] = new[] { "####.", "....#", "....#", "...#.", "..##.", "....#", "....#", "#...#", ".###." },
+        ['4'] = new[] { "...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#.", "...#.", "...#." },
+        ['5'] = new[] { "#####", "#....", "#....", "####.", "....#", "....#", "....#", "#...#", ".###." },
+        ['6'] = new[] { "..##.", ".#...", "#....", "#....", "####.", "#...#", "#...#", "#...#", ".###." },
+        ['7'] = new[] { "#####", "....#", "....#", "...#.", "...#.", "..#..", "..#..", ".#...", ".#..." },
+        ['8'] = new[] { ".###.", "#...#", "#...#", "#...#", ".###.", "#...#", "#...#", "#...#", ".###." },
+        ['9'] = new[] { ".###.", "#...#", "#...#", "#...#", ".####", "....#", "....#", "...#.", ".##.." },
+        ['.'] = new[] { "..", "..", "..", "..", "..", "..", "..", "##", "##" },
+        ['+'] = new[] { "...", "...", "...", ".#.", "###", ".#.", "...", "...", "..." },
+        ['-'] = new[] { "...", "...", "...", "...", "###", "...", "...", "...", "..." }
     };
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -975,28 +1007,30 @@ internal static class IconFactory
         ratio = Math.Clamp(ratio, 0, 1);
         int percent = (int)Math.Round(ratio * 100);
 
-        // 85% を超えたあたりから、じわっと赤寄りにする
+        // 85% を超えたあたりから、じわっと熱を持たせる。
+        // ただし本体を赤に寄せきると、青も緑も同じ色に潰れて「どれが限界なのか」が
+        // 分からなくなる（青×サーモンは灰色、ミント×サーモンは茶色になる）。
+        // 本体は指標の色を保ったまま少しだけ温め、危険はゲージの赤と表情で伝える。
         Color tone = percent >= 85
-            ? Blend(color, HotTone, (percent - 85) / 15.0 * 0.75)
+            ? Blend(color, HotTone, (percent - 85) / 15.0 * 0.25)
             : color;
 
         return style switch
         {
-            IconStyle.Face => CreatePixel(percent, tone, blink, recording),
+            IconStyle.Face => Render(BuildFace(percent, blink, recording), tone),
             IconStyle.Image when skin is not null
                 => CreateFromSkin(percent, tone, skin, smoothSkin, recording),
-            IconStyle.Image => CreatePixel(percent, tone, blink, recording),
-            _ => CreateNumber(ratio, text, tone, recording)
+            IconStyle.Image => Render(BuildFace(percent, blink, recording), tone),
+            _ => Render(BuildNumber(percent, text, recording), tone)
         };
     }
 
-    // ----- ドット絵 -------------------------------------------------------
+    // ----- グリッド共通 ---------------------------------------------------
 
-    private static Icon CreatePixel(int percent, Color tone, bool blink, bool recording)
+    /// <summary>組み上げたグリッドを、トレイの実表示サイズちょうどに敷き詰めて Icon にする。</summary>
+    private static Icon Render(char[][] grid, Color tone)
     {
-        // トレイの実サイズちょうどに描くのが要点。縮小されないのでドットが潰れない。
-        int size = Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 48);
-        char[][] grid = BuildSprite(percent, blink, recording);
+        int size = Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 64);
 
         using var bmp = new Bitmap(size, size);
         using (var g = Graphics.FromImage(bmp))
@@ -1010,73 +1044,134 @@ internal static class IconFactory
         return ToIcon(bmp);
     }
 
+    private static char[][] EmptyGrid()
+    {
+        var grid = new char[G][];
+        for (int y = 0; y < G; y++)
+        {
+            grid[y] = new char[G];
+            Array.Fill(grid[y], '.');
+        }
+        return grid;
+    }
+
+    private static int Stage(int percent)
+        => percent switch { < 20 => 0, < 50 => 1, < 80 => 2, < 95 => 3, _ => 4 };
+
+    /// <summary>
+    /// 下 2 行のゲージ。両端を 1 ドット空けて角が丸く見えるようにしてある。
+    /// しきい値を超えたら 'H'（赤）で塗り、本体の色を濁らせずに危険を伝える。
+    /// </summary>
+    private static void PaintGauge(char[][] grid, int percent)
+    {
+        char on = percent >= HotPercent ? 'H' : 'C';
+        int filled = (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 14);
+        for (int x = 1; x <= 14; x++)
+        {
+            char c = x - 1 < filled ? on : 'D';
+            for (int y = GaugeTop; y < G; y++) grid[y][x] = c;
+        }
+    }
+
+    /// <summary>ゲージが赤に切り替わる負荷。</summary>
+    private const int HotPercent = 85;
+
+    private static Color Hot(Color tone) => Blend(tone, HotTone, 0.85);
+
+    /// <summary>計測中の目印（左上の赤いドット）。</summary>
+    private static void PaintRecordingDot(char[][] grid)
+    {
+        grid[0][0] = 'R'; grid[0][1] = 'R';
+        grid[1][0] = 'R'; grid[1][1] = 'R';
+    }
+
     /// <summary>
     /// 負荷の段階ごとに表情を作る。
     /// 0:うとうと 1:ふつう 2:ごきげん 3:あせり 4:限界。
+    ///
+    /// 目は 3x3 に取ってハイライトを 1 ドット入れてある。16px では
+    /// 「目が大きい・つやがある・ほっぺがある」の 3 つがかわいさをほぼ決める。
     /// </summary>
-    private static char[][] BuildSprite(int percent, bool blink, bool recording)
+    private static char[][] BuildFace(int percent, bool blink, bool recording)
     {
         char[][] grid = BaseSprite.Select(row => row.ToCharArray()).ToArray();
 
-        int stage = percent switch { < 20 => 0, < 50 => 1, < 80 => 2, < 95 => 3, _ => 4 };
-        bool closedEyes = stage == 0 || (blink && stage < 3);
+        int stage = Stage(percent);
+        bool closedEyes = stage == 0 || (blink && stage is 1 or 2);
 
         void Set(int y, int x, char c)
         {
-            if (y is >= 0 and < 16 && x is >= 0 and < 16) grid[y][x] = c;
+            if (y is >= 0 and < G && x is >= 0 and < G) grid[y][x] = c;
         }
 
-        // 目（左右で 6 ドットずらして対称に置く）
+        // 顔は左右対称なので、左半分の座標だけ書いて右は自動で折り返す。
+        // こうしておくと表情をいじっても左右がずれない。
+        void Pair(int y, int x, char c) { Set(y, x, c); Set(y, G - 1 - x, c); }
+
+        // ----- 目（左目 x=3..5 / 右目 x=10..12、高さ y=5..8） -----
         if (stage == 4)
         {
-            foreach (int dx in new[] { 0, 6 })   // × 目
-            {
-                Set(5, 4 + dx, 'K'); Set(5, 6 + dx, 'K');
-                Set(6, 5 + dx, 'K');
-                Set(7, 4 + dx, 'K'); Set(7, 6 + dx, 'K');
-            }
+            // × 目
+            Pair(5, 3, 'K'); Pair(5, 5, 'K');
+            Pair(6, 4, 'K');
+            Pair(7, 3, 'K'); Pair(7, 5, 'K');
         }
         else if (closedEyes)
         {
-            for (int x = 3; x <= 6; x++) { Set(6, x, 'K'); Set(6, x + 6, 'K'); }
+            // 閉じ目。両端を上げた弧にすると、ただの横線より気持ちよさそうに見える。
+            Pair(6, 3, 'K'); Pair(6, 5, 'K');
+            Pair(7, 4, 'K');
         }
         else if (stage == 2)
         {
-            foreach (int dx in new[] { 0, 6 })   // ^ ^ の笑い目
-            {
-                Set(6, 3 + dx, 'K'); Set(5, 4 + dx, 'K');
-                Set(5, 5 + dx, 'K'); Set(6, 6 + dx, 'K');
-            }
+            // ^ ^ の笑い目
+            Pair(6, 4, 'K');
+            Pair(7, 3, 'K'); Pair(7, 4, 'K'); Pair(7, 5, 'K');
         }
         else
         {
-            foreach (int dx in new[] { 0, 6 })   // まる目
-                for (int y = 5; y <= 7; y++) { Set(y, 4 + dx, 'K'); Set(y, 5 + dx, 'K'); }
+            // まる目。上下の角を落として縦長の楕円にする。
+            // 真四角のまま塗ると黒が重すぎて、目というより穴に見えてしまう。
+            Pair(5, 4, 'K');
+            for (int y = 6; y <= 7; y++)
+                for (int x = 3; x <= 5; x++) Pair(y, x, 'K');
+            Pair(8, 4, 'K');
+
+            if (stage == 3) Pair(6, 4, 'W');   // 瞳だけ小さく残して「見開き」
+            else Pair(6, 3, 'W');              // つやのハイライト
         }
 
-        // 口
+        // ----- ほっぺ -----
+        if (stage <= 2)
+        {
+            Pair(9, 2, 'P'); Pair(9, 3, 'P');
+            if (stage == 2) { Pair(8, 2, 'P'); Pair(8, 3, 'P'); }   // ごきげんは濃いめ
+        }
+
+        // ----- 口 -----
         switch (stage)
         {
             case 0:
-                Set(10, 7, 'K'); Set(10, 8, 'K');
+                Pair(11, 7, 'K');                                   // ちいさい口
                 break;
             case 1:
-                for (int x = 6; x <= 9; x++) Set(10, x, 'K');
+                Pair(11, 6, 'K'); Pair(11, 7, 'K');                 // 一文字
                 break;
             case 2:
-                Set(9, 5, 'K'); Set(9, 10, 'K');
-                for (int x = 6; x <= 9; x++) Set(10, x, 'K');
+                Pair(10, 6, 'K'); Pair(10, 7, 'K');                 // 開いたにこにこ
+                Pair(11, 7, 'K');
                 break;
             case 3:
-                Set(10, 5, 'K'); Set(9, 6, 'K'); Set(10, 7, 'K'); Set(9, 8, 'K'); Set(10, 9, 'K');
+                Pair(10, 5, 'K'); Pair(10, 7, 'K');                 // ぎざぎざ
+                Pair(11, 6, 'K');
                 break;
             default:
-                for (int y = 9; y <= 11; y++)
-                    for (int x = 6; x <= 9; x++) Set(y, x, 'K');
+                for (int y = 10; y <= 12; y++)
+                    for (int x = 6; x <= 9; x++) Set(y, x, 'K');    // 大きく開いた口
                 break;
         }
 
-        // 付属物
+        // ----- 付属物 -----
         if (stage == 0)
         {
             // zzz
@@ -1086,48 +1181,119 @@ internal static class IconFactory
         }
         else if (stage >= 3)
         {
-            // 汗
+            // 汗。限界のときは反対側にもう 1 粒足す。
             Set(2, 1, 'B'); Set(3, 0, 'B'); Set(3, 1, 'B'); Set(4, 0, 'B'); Set(4, 1, 'B');
+            if (stage == 4)
+            {
+                Set(2, 14, 'B'); Set(3, 15, 'B'); Set(3, 14, 'B');
+                Set(4, 15, 'B'); Set(4, 14, 'B');
+            }
         }
 
-        // 計測中の目印（左上の赤いドット）
-        if (recording)
-        {
-            Set(0, 0, 'R'); Set(0, 1, 'R');
-            Set(1, 0, 'R'); Set(1, 1, 'R');
-        }
-
-        // 下 2 行は正確な値を示すゲージ
-        int filled = (int)Math.Round(percent / 100.0 * 16);
-        for (int x = 0; x < 16; x++)
-        {
-            char c = x < filled ? 'C' : 'D';
-            grid[14][x] = c;
-            grid[15][x] = c;
-        }
-
+        if (recording) PaintRecordingDot(grid);
+        PaintGauge(grid, percent);
         return grid;
+    }
+
+    // ----- 数字 -----------------------------------------------------------
+
+    /// <summary>
+    /// 数字を白いドットで置き、そのまわりを 1 ドット暗く縁取る。
+    /// タスクバーが明色でも暗色でも読めるようにするための縁取り。
+    /// </summary>
+    private static char[][] BuildNumber(int percent, string text, bool recording)
+    {
+        char[][] grid = EmptyGrid();
+
+        List<string[]> glyphs = text.Where(Glyphs.ContainsKey).Select(c => Glyphs[c]).ToList();
+        if (glyphs.Count == 0) glyphs.Add(Glyphs['-']);
+
+        // 字間は 1 ドット。字そのものが 16 に入らないときだけ 0 に詰める。
+        // 縁取りぶんまで数えて詰めると "99+" の 9 と 9 がくっついて 1 文字に見えてしまうので、
+        // 端の縁取りが欠けるほうを許容している。
+        int sum = glyphs.Sum(gl => gl[0].Length);
+        int gap = sum + (glyphs.Count - 1) <= G ? 1 : 0;
+        int width = sum + gap * (glyphs.Count - 1);
+
+        int x0 = (G - width) / 2;
+        const int y0 = 3;   // 高さ 9 なので y=3..11。下のゲージ(y=14,15)と 2 ドット空く。
+
+        foreach (string[] glyph in glyphs)
+        {
+            for (int y = 0; y < glyph.Length; y++)
+            {
+                for (int x = 0; x < glyph[y].Length; x++)
+                {
+                    if (glyph[y][x] != '#') continue;
+                    int gy = y0 + y, gx = x0 + x;
+                    if (gy is >= 0 and < G && gx is >= 0 and < G) grid[gy][gx] = 'W';
+                }
+            }
+            x0 += glyph[0].Length + gap;
+        }
+
+        Outline(grid);
+        if (recording) PaintRecordingDot(grid);
+        PaintGauge(grid, percent);
+        return grid;
+    }
+
+    /// <summary>白ドットに接している透明セルを縁色にする。</summary>
+    private static void Outline(char[][] grid)
+    {
+        var edges = new List<(int Y, int X)>();
+        for (int y = 0; y < G; y++)
+        {
+            for (int x = 0; x < G; x++)
+            {
+                if (grid[y][x] != '.') continue;
+
+                bool touching = false;
+                for (int dy = -1; dy <= 1 && !touching; dy++)
+                {
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int ny = y + dy, nx = x + dx;
+                        if (ny is >= 0 and < G && nx is >= 0 and < G && grid[ny][nx] == 'W')
+                        {
+                            touching = true;
+                            break;
+                        }
+                    }
+                }
+                if (touching) edges.Add((y, x));
+            }
+        }
+        // 走査中に書き換えると縁が縁を呼んで太るので、集めてから塗る
+        foreach ((int y, int x) in edges) grid[y][x] = '#';
     }
 
     private static void PaintSprite(Graphics g, char[][] grid, int size, Color tone)
     {
         var palette = new Dictionary<char, SolidBrush>
         {
-            ['#'] = new SolidBrush(Color.FromArgb(215, 20, 20, 24)),
+            // 輪郭は真っ黒ではなく本体色を少し混ぜた暗色にしてある。硬さが取れて印象が柔らかい。
+            ['#'] = new SolidBrush(Color.FromArgb(230, Blend(Color.FromArgb(16, 16, 22), tone, 0.22))),
             ['C'] = new SolidBrush(tone),
-            ['K'] = new SolidBrush(Color.FromArgb(235, 15, 15, 18)),
+            ['H'] = new SolidBrush(Hot(tone)),
+            ['L'] = new SolidBrush(Blend(tone, Color.White, 0.26)),
+            ['c'] = new SolidBrush(Blend(tone, Color.FromArgb(20, 20, 30), 0.22)),
+            ['K'] = new SolidBrush(Color.FromArgb(238, 16, 16, 20)),
             ['W'] = new SolidBrush(Color.White),
+            ['P'] = new SolidBrush(Blend(tone, Color.FromArgb(255, 118, 140), 0.55)),
             ['B'] = new SolidBrush(Color.FromArgb(240, 130, 210, 255)),
-            ['D'] = new SolidBrush(Color.FromArgb(80, 140, 140, 150)),
+            // ゲージの下地。薄すぎるとアイコンが欠けて見えるので、
+            // 「まだ伸びていない目盛り」だと分かる程度には出しておく。
+            ['D'] = new SolidBrush(Color.FromArgb(150, 148, 148, 160)),
             ['R'] = new SolidBrush(Color.FromArgb(245, 235, 60, 60))
         };
 
         try
         {
-            double cell = size / 16.0;
-            for (int y = 0; y < 16; y++)
+            double cell = size / (double)G;
+            for (int y = 0; y < G; y++)
             {
-                for (int x = 0; x < 16; x++)
+                for (int x = 0; x < G; x++)
                 {
                     if (!palette.TryGetValue(grid[y][x], out SolidBrush? brush)) continue;
 
@@ -1156,7 +1322,7 @@ internal static class IconFactory
     {
         // 実際に表示される大きさ。100% 表示なら 16、150% なら 24、200% なら 32。
         int size = Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 64);
-        int stage = percent switch { < 20 => 0, < 50 => 1, < 80 => 2, < 95 => 3, _ => 4 };
+        int stage = Stage(percent);
 
         using var bmp = new Bitmap(size, size);
         using (var g = Graphics.FromImage(bmp))
@@ -1199,18 +1365,20 @@ internal static class IconFactory
                     g.FillRectangle(sweat, Cell(x, y));
             }
 
-            // 下部のゲージ
-            float barHeight = Math.Max(2f, size / 8f);
-            float barTop = size - barHeight;
-            using (var off = new SolidBrush(Color.FromArgb(190, 28, 28, 32)))
-                g.FillRectangle(off, 0, barTop, size, barHeight);
-            using (var on = new SolidBrush(tone))
-                g.FillRectangle(on, 0, barTop, size * percent / 100f, barHeight);
+            // 下部のゲージ。ドット絵モードと同じ「下 2 行・両端 1 ドット空け」に揃える。
+            float barTop = GaugeTop * u;
+            float barLeft = u;
+            float barWidth = 14 * u;
+            using (var off = new SolidBrush(Color.FromArgb(150, 148, 148, 160)))
+                g.FillRectangle(off, barLeft, barTop, barWidth, size - barTop);
+            using (var on = new SolidBrush(percent >= HotPercent ? Hot(tone) : tone))
+                g.FillRectangle(on, barLeft, barTop,
+                                barWidth * Math.Clamp(percent, 0, 100) / 100f, size - barTop);
 
             if (recording)
             {
                 using var dot = new SolidBrush(Color.FromArgb(245, 235, 60, 60));
-                g.FillEllipse(dot, 0, 0, size / 3f, size / 3f);
+                g.FillRectangle(dot, 0, 0, 2 * u, 2 * u);
             }
         }
         return ToIcon(bmp);
@@ -1240,60 +1408,6 @@ internal static class IconFactory
         return attributes;
     }
 
-    // ----- 数字（シンプル表示） -------------------------------------------
-
-    private static Icon CreateNumber(double ratio, string text, Color tone, bool recording)
-    {
-        const int size = 32;
-
-        using var bmp = new Bitmap(size, size);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.Clear(Color.Transparent);
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-
-            var body = new Rectangle(1, 1, size - 3, size - 3);
-            using GraphicsPath shape = RoundedRect(body, 9);
-
-            int filled = (int)Math.Round(body.Height * ratio);
-            g.SetClip(shape);
-            using (var back = new SolidBrush(Color.FromArgb(55, tone)))
-                g.FillRectangle(back, body);
-            using (var bar = new SolidBrush(Color.FromArgb(185, tone)))
-                g.FillRectangle(bar, body.Left, body.Bottom - filled, body.Width, filled);
-            g.ResetClip();
-
-            using (var border = new Pen(Color.FromArgb(215, tone), 2f))
-                g.DrawPath(border, shape);
-
-            float emSize = text.Length switch { >= 3 => 17f, 2 => 21f, _ => 25f };
-            using var font = new Font("Segoe UI", emSize, FontStyle.Bold, GraphicsUnit.Pixel);
-            using var format = new StringFormat
-            {
-                Alignment = StringAlignment.Center,
-                LineAlignment = StringAlignment.Center
-            };
-
-            // 縁取りしてから白抜き → タスクバーが明色でも暗色でも読める
-            using (var shadow = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
-            {
-                for (int dx = -1; dx <= 1; dx++)
-                    for (int dy = -1; dy <= 1; dy++)
-                        if (dx != 0 || dy != 0)
-                            g.DrawString(text, font, shadow, new RectangleF(dx, dy, size, size), format);
-            }
-            g.DrawString(text, font, Brushes.White, new RectangleF(0, 0, size, size), format);
-
-            if (recording)
-            {
-                using var dot = new SolidBrush(Color.FromArgb(245, 235, 60, 60));
-                g.FillEllipse(dot, 0, 0, 10, 10);
-            }
-        }
-        return ToIcon(bmp);
-    }
-
     // ----- 共通 -----------------------------------------------------------
 
     private static Icon ToIcon(Bitmap bmp)
@@ -1308,18 +1422,6 @@ internal static class IconFactory
         {
             DestroyIcon(handle);
         }
-    }
-
-    private static GraphicsPath RoundedRect(Rectangle r, int radius)
-    {
-        int d = radius * 2;
-        var path = new GraphicsPath();
-        path.AddArc(r.Left, r.Top, d, d, 180, 90);
-        path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
-        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-        path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
     }
 
     private static Color Blend(Color from, Color to, double amount)
@@ -2064,7 +2166,13 @@ internal static class Settings
 
     public static IconStyle Style
     {
-        get => Read("Style", 1) == 0 ? IconStyle.Number : IconStyle.Face;
+        // Image(2) を取りこぼすと、画像から作ったアイコンが再起動のたびに内蔵キャラへ戻る
+        get => Read("Style", 1) switch
+        {
+            0 => IconStyle.Number,
+            2 => IconStyle.Image,
+            _ => IconStyle.Face
+        };
         set => Write("Style", (int)value);
     }
 
