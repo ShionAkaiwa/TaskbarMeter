@@ -2002,7 +2002,18 @@ internal sealed class SetupForm : Form
             (IconStyle.Image, "好きな画像", "画像をドット絵に変換します")
         };
 
-        var buttons = new List<RadioButton>();
+        // ラジオを設定の値に合わせ直す。画像を選ぶのをやめたときに元へ戻すのに使う。
+        var buttons = new List<(IconStyle Style, RadioButton Button)>();
+        void SyncRadios()
+        {
+            _syncing = true;
+            try
+            {
+                foreach ((IconStyle style, RadioButton button) in buttons)
+                    button.Checked = Settings.Style == style;
+            }
+            finally { _syncing = false; }
+        }
 
         foreach ((IconStyle style, string label, string note) in choices)
         {
@@ -2041,16 +2052,14 @@ internal sealed class SetupForm : Form
             {
                 if (_syncing || !radio.Checked) return;
 
-                // 画像がまだ無いのに「好きな画像」を選ばれたら、先に画像を作ってもらう
+                // 画像がまだ無いのに「好きな画像」を選ばれたら、先に画像を作ってもらう。
+                // 途中でやめられたら、選択を元の見た目に戻す。
                 if (captured == IconStyle.Image && _skin() is null)
                 {
                     _chooseImage();
                     if (_skin() is null)
                     {
-                        _syncing = true;
-                        radio.Checked = false;
-                        buttons.First(b => b.Text == "ドット絵キャラ").Checked = true;
-                        _syncing = false;
+                        SyncRadios();
                         return;
                     }
                 }
@@ -2060,7 +2069,7 @@ internal sealed class SetupForm : Form
                 RefreshPreviews();
             };
             Controls.Add(radio);
-            buttons.Add(radio);
+            buttons.Add((captured, radio));
 
             Controls.Add(new Label
             {
