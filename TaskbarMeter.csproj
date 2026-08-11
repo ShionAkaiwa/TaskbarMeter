@@ -15,6 +15,10 @@
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!--
+      圧縮は残す。外すと exe が 68MB → 154MB になり、初回起動の展開が
+      かえって遅くなる（実測 6 秒 → 8 秒）。ZIP のサイズはどちらでも約 63MB で変わらない。
+    -->
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
   </PropertyGroup>

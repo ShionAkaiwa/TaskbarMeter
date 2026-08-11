@@ -2080,6 +2080,54 @@ internal sealed class SetupForm : Form
         ClientSize = new Size(width, bodyHeight + barHeight);
     }
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachThreadInput(uint attach, uint attachTo, bool join);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    /// <summary>
+    /// 確実に前面へ出す。
+    ///
+    /// exe をダブルクリック → SmartScreen の「実行」という流れだと、前面はエクスプローラーのまま。
+    /// Windows は「いま前面にいるアプリ以外」からの前面化を拒むため、ふつうに `Activate()` を
+    /// 呼んでもこの画面は後ろに隠れ、「案内画面が出てこない」と受け取られる。
+    /// 前面のスレッドに入力状態を一時的に結び付けると、同じ入力キューの一員として扱われ、
+    /// 前面化が通る。結び付けは必ず外すこと。
+    /// </summary>
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+
+        IntPtr foreground = GetForegroundWindow();
+        uint theirs = GetWindowThreadProcessId(foreground, IntPtr.Zero);
+        uint ours = GetCurrentThreadId();
+        bool attached = theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true);
+
+        try
+        {
+            TopMost = true;
+            TopMost = false;   // 出したあとは普通のウィンドウに戻す（常時最前面は邪魔なので）
+            Activate();
+            SetForegroundWindow(Handle);
+        }
+        finally
+        {
+            if (attached) AttachThreadInput(ours, theirs, false);
+        }
+    }
+
     // ----- 見出し ---------------------------------------------------------
 
     private int BuildHeader(int y, bool firstRun)
