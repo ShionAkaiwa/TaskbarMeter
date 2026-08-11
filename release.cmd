@@ -11,6 +11,10 @@ if not exist "TaskbarMeter.csproj" (
 
 echo [1/3] Stopping running instance...
 taskkill /IM TaskbarMeter.exe /F >nul 2>&1
+rem Windows can hold the file lock for a moment after the process dies, and
+rem publishing into a still-locked exe fails. ping is used as a sleep because
+rem timeout refuses to run when stdin is redirected.
+ping -n 3 127.0.0.1 >nul
 
 echo [2/3] Building...
 call dotnet publish -c Release

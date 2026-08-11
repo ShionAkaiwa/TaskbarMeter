@@ -66,7 +66,8 @@ internal readonly record struct IconMood(
 
 internal sealed class MeterContext : ApplicationContext
 {
-    private const int CooldownSeconds = 5;   // 高負荷モードで消えるまでの猶予
+    private const int CooldownSeconds = 5;         // 高負荷モードで消えるまでの猶予
+    private const int PromoteRetrySeconds = 30;    // 「タスクバーに出す」を試し続ける秒数
 
     private sealed class Slot
     {
@@ -118,6 +119,9 @@ internal sealed class MeterContext : ApplicationContext
     /// <summary>設定画面を二重に開かないための目印。</summary>
     private bool _settingsOpen;
 
+    /// <summary>「タスクバーに出す」を残り何回試すか。成功したら 0 にする。</summary>
+    private int _promoteTries;
+
     private bool _forceShow;
     private bool _forceHide;
     private int _cooldown;
@@ -156,10 +160,14 @@ internal sealed class MeterContext : ApplicationContext
                 _pendingSettings = false;
                 ShowSetup(firstRun: false);
             }
-            else if (_tick == 2 && Settings.PromoteTray)
+            else if (_promoteTries > 0 && _tick >= 2)
             {
-                // 起動のたびに掛け直す。アイコンが一度出たあとでないとエントリが無い。
-                TrayPromotion.Promote();
+                // 「タスクバーに出す」は Windows 側にエントリができてからでないと書けない。
+                // エントリはアイコンを出してから数秒遅れて作られることがあり、
+                // 一度きりで試すと早すぎて空振りし、そのまま二度と表に出てこない。
+                // 成功するまで数十秒のあいだ試し続ける。
+                if (TrayPromotion.Promote()) _promoteTries = 0;
+                else _promoteTries--;
             }
         };
         _timer.Start();
@@ -411,6 +419,10 @@ internal sealed class MeterContext : ApplicationContext
         _style = Settings.Style;
         _skinSmooth = Settings.SkinSmooth;
         if (_style == IconStyle.Image && _skin is null) _skin = PixelSkin.LoadSaved();
+
+        // 「タスクバーに出す」を押した直後はまだエントリが無いことがあるので、
+        // ここでも試行回数を積み直しておく
+        if (Settings.PromoteTray) _promoteTries = Math.Max(_promoteTries, PromoteRetrySeconds);
 
         SyncSlots();
         RefreshModeChecks();
@@ -2320,7 +2332,8 @@ internal sealed class SetupForm : Form
             bool ok = TrayPromotion.Promote();
             _apply();
             result.ForeColor = ok ? Color.FromArgb(130, 230, 160) : Color.FromArgb(255, 190, 120);
-            result.Text = ok ? "出しました。" : "うまくいきませんでした。下の手順でどうぞ。";
+            // 失敗しても常駐側が数十秒は試し続けるので、言い切らずに待ってもらう
+            result.Text = ok ? "出しました。" : "少し待ってください。変わらなければ下の手順で。";
         };
         _body.Controls.Add(button);
         _body.Controls.Add(result);
