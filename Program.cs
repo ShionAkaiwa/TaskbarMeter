@@ -50,6 +50,16 @@ internal enum IconStyle
 internal readonly record struct Sample(
     double Ratio, string Text, string Tooltip, double Value = 0, string Unit = "%");
 
+/// <summary>
+/// アイコンに乗せる「今の状況」。数値そのものではなく、まばたきの位相や
+/// 他の指標との関係など、表情を決めるための材料をまとめて渡す。
+/// </summary>
+/// <param name="Tick">起動からの秒数。まばたきの位相に使う。</param>
+/// <param name="Recording">計測中か。</param>
+/// <param name="OthersBusy">自分以外に限界近くまで働いている指標があるか。</param>
+internal readonly record struct IconMood(
+    int Tick = 0, bool Recording = false, bool OthersBusy = false);
+
 // ---------------------------------------------------------------------------
 //  本体
 // ---------------------------------------------------------------------------
@@ -87,6 +97,8 @@ internal sealed class MeterContext : ApplicationContext
     private bool _gpuBusySeen;
     private int _gpuIdleSeconds;
     private bool _finishNotified;
+    private int _vramHighSeconds;
+    private bool _vramNotified;
 
     private DisplayMode _mode = Settings.Mode;
     private int _threshold = Settings.Threshold;
@@ -508,6 +520,7 @@ internal sealed class MeterContext : ApplicationContext
         }
 
         _lastSamples = samples;
+        WatchVramPressure(samples);
         if (_recorder.Recording)
         {
             _recorder.Add(DateTime.Now, samples);
@@ -522,15 +535,26 @@ internal sealed class MeterContext : ApplicationContext
         SetVisible(shouldShow);
         if (!_iconsVisible) return;
 
-        bool blink = _tick % 9 == 0;
+        // 「自分以外でいちばん働いている指標」を知るために上位 2 つを控えておく。
+        // 自分が 1 位なら 2 位が、そうでなければ 1 位が「隣の忙しさ」になる。
+        double top1 = 0, top2 = 0;
+        foreach (Sample s in samples.Values)
+        {
+            if (s.Ratio > top1) { top2 = top1; top1 = s.Ratio; }
+            else if (s.Ratio > top2) { top2 = s.Ratio; }
+        }
+
         foreach (Slot slot in ActiveSlots)
         {
             Sample sample = samples[slot.Metric.Id];
             Color color = Settings.MetricColor(slot.Metric.Id, slot.Metric.DefaultColor);
 
+            double othersPeak = sample.Ratio >= top1 ? top2 : top1;
+            var mood = new IconMood(_tick, _recorder.Recording, othersPeak >= 0.80);
+
             IconStyle style = _style == IconStyle.Image && _skin is null ? IconStyle.Face : _style;
             Icon fresh = IconFactory.Create(sample.Ratio, sample.Text, color, style,
-                                            blink, _recorder.Recording, _skin, _skinSmooth);
+                                            mood, _skin, _skinSmooth);
             slot.Notify.Icon = fresh;
             slot.Current?.Dispose();
             slot.Current = fresh;
@@ -571,6 +595,43 @@ internal sealed class MeterContext : ApplicationContext
         _gpuIdleSeconds = 0;
         _finishNotified = false;
         Notify("計測を開始しました。停止するまで記録し続けます。", ToolTipIcon.Info);
+    }
+
+    /// <summary>
+    /// VRAM が上限に近づいたら知らせる。
+    /// 学習中の OOM は落ちてから気づくことが多く、数十秒でも前に分かれば
+    /// バッチサイズを下げて回し直せる。VRAM を表示している人にだけ出す。
+    ///
+    /// 総容量が読めなかった環境では Ratio が「観測した最大値ぶんの現在値」になり、
+    /// 更新のたびに 100% へ張り付いてしまうので、その場合は何もしない。
+    /// </summary>
+    private void WatchVramPressure(Dictionary<string, Sample> samples)
+    {
+        if (!samples.TryGetValue("vram", out Sample vram) ||
+            !_slots.TryGetValue("vram", out Slot? slot) ||
+            slot.Metric is not VramMetric { TotalKnown: true })
+        {
+            _vramHighSeconds = 0;
+            return;
+        }
+
+        if (vram.Ratio >= 0.90)
+        {
+            // 一瞬の跳ねで鳴らさないよう、続いたことを確かめてから出す
+            _vramHighSeconds++;
+            if (_vramHighSeconds >= 5 && !_vramNotified)
+            {
+                _vramNotified = true;
+                Notify($"VRAM が {(int)Math.Round(vram.Ratio * 100)}% です。" +
+                       "このまま増えると学習が落ちるかもしれません。",
+                       ToolTipIcon.Warning, "VRAM がいっぱいです");
+            }
+            return;
+        }
+
+        _vramHighSeconds = 0;
+        // 90% 付近で出たり入ったりするたびに鳴らさないよう、十分下がってから鳴り直す
+        if (vram.Ratio < 0.80) _vramNotified = false;
     }
 
     /// <summary>
@@ -977,6 +1038,12 @@ internal sealed class VramMetric : CounterMetric
     public override string Name => "VRAM 使用量";
     public override Color DefaultColor => Color.FromArgb(107, 209, 192);
 
+    /// <summary>
+    /// 総容量が読めたか。読めていないと Ratio は「観測した最大値ぶんの現在値」になり、
+    /// 逼迫の判定には使えない。
+    /// </summary>
+    public bool TotalKnown => _totalBytes > 0;
+
     protected override string CategoryEnglish => "GPU Adapter Memory";
     protected override string CounterEnglish => "Dedicated Usage";
     protected override bool UseMax => true;   // アダプタごとに出るので合算しない
@@ -1153,7 +1220,7 @@ internal static class IconFactory
     private static extern bool DestroyIcon(IntPtr handle);
 
     public static Icon Create(double ratio, string text, Color color, IconStyle style,
-                              bool blink, bool recording = false, PixelSkin? skin = null,
+                              IconMood mood = default, PixelSkin? skin = null,
                               bool smoothSkin = true)
     {
         ratio = Math.Clamp(ratio, 0, 1);
@@ -1169,11 +1236,11 @@ internal static class IconFactory
 
         return style switch
         {
-            IconStyle.Face => Render(BuildFace(percent, blink, recording), tone),
+            IconStyle.Face => Render(BuildFace(percent, mood), tone),
             IconStyle.Image when skin is not null
-                => CreateFromSkin(percent, tone, skin, smoothSkin, recording),
-            IconStyle.Image => Render(BuildFace(percent, blink, recording), tone),
-            _ => Render(BuildNumber(percent, text, recording), tone)
+                => CreateFromSkin(percent, tone, skin, smoothSkin, mood.Recording),
+            IconStyle.Image => Render(BuildFace(percent, mood), tone),
+            _ => Render(BuildNumber(percent, text, mood.Recording), tone)
         };
     }
 
@@ -1244,12 +1311,19 @@ internal static class IconFactory
     /// 目は 3x3 に取ってハイライトを 1 ドット入れてある。16px では
     /// 「目が大きい・つやがある・ほっぺがある」の 3 つがかわいさをほぼ決める。
     /// </summary>
-    private static char[][] BuildFace(int percent, bool blink, bool recording)
+    private static char[][] BuildFace(int percent, IconMood mood)
     {
         char[][] grid = BaseSprite.Select(row => row.ToCharArray()).ToArray();
 
         int stage = Stage(percent);
+        bool blink = mood.Tick % 9 == 0;
         bool closedEyes = stage == 0 || (blink && stage is 1 or 2);
+
+        // 自分は暇なのに、隣で誰かが限界まで働いている状態。
+        // 眠るのではなく「待ちぼうけ」の顔にする。かわいさのためだけでなく、
+        // GPU が待ちぼうけ + CPU が限界 = データ供給待ち、と読めるようにするため。
+        bool waiting = stage == 0 && mood.OthersBusy;
+        if (waiting) closedEyes = false;
 
         void Set(int y, int x, char c)
         {
@@ -1260,6 +1334,15 @@ internal static class IconFactory
         // こうしておくと表情をいじっても左右がずれない。
         void Pair(int y, int x, char c) { Set(y, x, c); Set(y, G - 1 - x, c); }
 
+        // 縦長の楕円の目。真四角のまま塗ると黒が重すぎて、目というより穴に見えてしまう。
+        void OvalEye(int left, int top)
+        {
+            Set(top, left + 1, 'K');
+            for (int y = top + 1; y <= top + 2; y++)
+                for (int x = left; x <= left + 2; x++) Set(y, x, 'K');
+            Set(top + 3, left + 1, 'K');
+        }
+
         // ----- 目（左目 x=3..5 / 右目 x=10..12、高さ y=5..8） -----
         if (stage == 4)
         {
@@ -1267,6 +1350,14 @@ internal static class IconFactory
             Pair(5, 3, 'K'); Pair(5, 5, 'K');
             Pair(6, 4, 'K');
             Pair(7, 3, 'K'); Pair(7, 5, 'K');
+        }
+        else if (waiting)
+        {
+            // よそ見。ここだけは Pair を使わない。左右対称にずらすと目が離れて
+            // 驚き顔になってしまうので、両目とも同じ向きへずらす必要がある。
+            OvalEye(2, 5);
+            OvalEye(9, 5);
+            Set(6, 2, 'W'); Set(6, 9, 'W');
         }
         else if (closedEyes)
         {
@@ -1282,12 +1373,8 @@ internal static class IconFactory
         }
         else
         {
-            // まる目。上下の角を落として縦長の楕円にする。
-            // 真四角のまま塗ると黒が重すぎて、目というより穴に見えてしまう。
-            Pair(5, 4, 'K');
-            for (int y = 6; y <= 7; y++)
-                for (int x = 3; x <= 5; x++) Pair(y, x, 'K');
-            Pair(8, 4, 'K');
+            OvalEye(3, 5);
+            OvalEye(10, 5);
 
             if (stage == 3) Pair(6, 4, 'W');   // 瞳だけ小さく残して「見開き」
             else Pair(6, 3, 'W');              // つやのハイライト
@@ -1324,7 +1411,13 @@ internal static class IconFactory
         }
 
         // ----- 付属物 -----
-        if (stage == 0)
+        if (waiting)
+        {
+            // 「…」。隣り合わせると 1 本の白い棒に見えてしまうので 1 ドットずつ空ける。
+            // 頭の輪郭を避けられる y=0 なら 3 つ並べる幅がある。
+            Set(0, 11, 'W'); Set(0, 13, 'W'); Set(0, 15, 'W');
+        }
+        else if (stage == 0)
         {
             // zzz
             Set(0, 13, 'W'); Set(0, 14, 'W'); Set(0, 15, 'W');
@@ -1342,7 +1435,7 @@ internal static class IconFactory
             }
         }
 
-        if (recording) PaintRecordingDot(grid);
+        if (mood.Recording) PaintRecordingDot(grid);
         PaintGauge(grid, percent);
         return grid;
     }
@@ -2343,7 +2436,7 @@ internal sealed class SetupForm : Form
         if (style == IconStyle.Image && skin is null) style = IconStyle.Face;
 
         using Icon icon = IconFactory.Create(ratio, text, color, style,
-                                             blink: false, recording: false,
+                                             mood: default,
                                              skin: skin, smoothSkin: Settings.SkinSmooth);
         using Bitmap bmp = icon.ToBitmap();
 

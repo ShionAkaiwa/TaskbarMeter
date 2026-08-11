@@ -47,8 +47,11 @@ Windows のタスクバー（通知領域）に、CPU / GPU / VRAM などの使�
 ## そのほかの機能
 
 - **初回セットアップ画面** — 表示する項目・見た目・タスクバーへの表示・自動起動を 1 画面で
+- **アイコン同士の掛け合い** — 自分は暇なのに隣が限界だと「待ちぼうけ」の顔になる。
+  GPU が待ちぼうけ + CPU が限界 = データ供給待ち、とひと目で分かる
 - **計測セッション** — 開始/停止で記録し、折れ線グラフ＋平均/最大/最小を表示。CSV 保存も可
 - **見守り通知** — GPU が高負荷のあと 3 分ほぼ 0% なら「終わったかも」と知らせる
+- **VRAM 逼迫アラート** — VRAM が 90% を超え続けたら警告。OOM で落ちる前に気づける
 - **表示モード** — 常に表示 / 高負荷のときだけ表示（しきい値を選択可）
 - **Ctrl+Alt+M** — 表示のトグル
 - **自動起動** — HKCU の Run キーに登録（管理者権限は不要）
@@ -94,22 +97,31 @@ exe は約 70MB あります。**Git リポジトリに直接置かず、GitHub 
 
 ZIP に包むとこの警告は出ません（起動時の SmartScreen 警告は別途出ます）。
 
-```powershell
-# exe と お読みください.txt を 1 つのフォルダに集めてから
-Compress-Archive -Path .\pkg\* -DestinationPath TaskbarMeter_v1.0.zip -CompressionLevel Optimal
-```
-
 ### 手順
 
-1. `build.cmd` でビルドする
-2. exe と `お読みください.txt` を ZIP にまとめる
-3. リリースを作って ZIP を添付する
-
-```bash
-gh release create v1.1 TaskbarMeter_v1.1.zip --title "TaskbarMeter v1.1" --notes "変更点"
+```
+release.cmd
 ```
 
-4. 相手には Releases ページの URL を渡す
+ビルドから梱包までやって `dist\TaskbarMeter.zip` を作ります。
+中身は exe と `dist-template\お読みください.txt` です。あとは添付するだけ。
+
+```bash
+gh release create v1.2 dist\TaskbarMeter.zip --title "TaskbarMeter v1.2" --notes "変更点"
+```
+
+### ZIP の名前に version を入れないこと
+
+`TaskbarMeter.zip` という固定名にしてあるのは、この URL を不変にするためです。
+
+```
+https://github.com/ShionAkaiwa/TaskbarMeter/releases/latest/download/TaskbarMeter.zip
+```
+
+`releases/latest/download/<ファイル名>` は、常に最新リリースの同名アセットを返します。
+version を名前に入れると、リリースのたびにこの URL が変わり、
+配った相手のブックマークが切れます。version はリリースのタグと
+`お読みください.txt` の中で示せば足ります。
 
 渡すときに一緒に伝えること：
 
