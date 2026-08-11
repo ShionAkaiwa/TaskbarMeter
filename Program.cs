@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32;
@@ -62,6 +63,9 @@ internal sealed class MeterContext : ApplicationContext
         public required Metric Metric { get; init; }
         public required NotifyIcon Notify { get; init; }
         public Icon? Current { get; set; }
+
+        /// <summary>ユーザーが表示 ON にしているか。OFF のあいだは読み取りもしない。</summary>
+        public bool Enabled { get; set; }
     }
 
     private readonly List<Metric> _metrics = MetricCatalog.CreateAll();
@@ -96,6 +100,12 @@ internal sealed class MeterContext : ApplicationContext
     /// <summary>初回セットアップをまだ出していないか。最初のタイマー tick で開く。</summary>
     private bool _pendingSetup;
 
+    /// <summary>exe の再起動で「設定を開いて」と頼まれたか。</summary>
+    private bool _pendingSettings;
+
+    /// <summary>設定画面を二重に開かないための目印。</summary>
+    private bool _settingsOpen;
+
     private bool _forceShow;
     private bool _forceHide;
     private int _cooldown;
@@ -107,7 +117,7 @@ internal sealed class MeterContext : ApplicationContext
     {
         _showRequest = showRequest;
         BuildMenu();
-        SyncSlots();
+        CreateSlots();
 
         _hotkey.Pressed += ToggleVisibility;
 
@@ -116,13 +126,29 @@ internal sealed class MeterContext : ApplicationContext
         {
             Update();
 
-            // 初回セットアップはここで開く。コンストラクタ（= Application.Run の前）で
+            // セットアップ／設定画面はここで開く。コンストラクタ（= Application.Run の前）で
             // モーダルを出すと動作が不安定なので、メッセージループが回り始めてからにする。
             // アイコンが 1 秒ぶん表示済みになるため、「タスクバーに出す」が参照する
             // レジストリのエントリが用意できている、という意味でも都合がよい。
-            if (!_pendingSetup) return;
-            _pendingSetup = false;
-            ShowSetup(firstRun: true);
+            if (_pendingSetup)
+            {
+                _pendingSetup = false;
+
+                // 見失わないための保険は初回に先回りして作っておく。
+                // 設定画面のチェックはこの結果をそのまま映すので、表示と実態がずれない。
+                StartMenuShortcut.Create();
+                ShowSetup(firstRun: true);
+            }
+            else if (_pendingSettings)
+            {
+                _pendingSettings = false;
+                ShowSetup(firstRun: false);
+            }
+            else if (_tick == 2 && Settings.PromoteTray)
+            {
+                // 起動のたびに掛け直す。アイコンが一度出たあとでないとエントリが無い。
+                TrayPromotion.Promote();
+            }
         };
         _timer.Start();
         Update();
@@ -200,7 +226,7 @@ internal sealed class MeterContext : ApplicationContext
         _menu.Items.Add(new ToolStripSeparator());
 
         var exit = new ToolStripMenuItem("終了");
-        exit.Click += (_, _) => Quit();
+        exit.Click += (_, _) => ConfirmQuit();
         _menu.Items.Add(exit);
 
         RefreshModeChecks();
@@ -242,7 +268,7 @@ internal sealed class MeterContext : ApplicationContext
                 if (_syncingMenu) return;
 
                 // 全部消すとメニューに触れなくなるので、最後の1つは外させない
-                if (!item.Checked && _slots.Count <= 1)
+                if (!item.Checked && EnabledCount <= 1)
                 {
                     item.Checked = true;
                     Notify("最低 1 つは表示したままにしてください。", ToolTipIcon.Info);
@@ -347,9 +373,19 @@ internal sealed class MeterContext : ApplicationContext
     /// </summary>
     private void ShowSetup(bool firstRun)
     {
-        using var form = new SetupForm(_metrics, firstRun, ReloadFromSettings,
-                                       () => _skin, ChooseImage);
-        form.ShowDialog();
+        if (_settingsOpen) return;
+
+        _settingsOpen = true;
+        try
+        {
+            using var form = new SetupForm(_metrics, firstRun, ReloadFromSettings,
+                                           () => _skin, ChooseImage);
+            form.ShowDialog();
+        }
+        finally
+        {
+            _settingsOpen = false;
+        }
 
         Settings.SetupDone = true;
         ReloadFromSettings();
@@ -406,49 +442,65 @@ internal sealed class MeterContext : ApplicationContext
 
     // ----- 表示するアイコンの増減 ----------------------------------------
 
-    private void SyncSlots()
+    /// <summary>
+    /// トレイアイコンの器を、指標ぶん最初にまとめて作る。
+    ///
+    /// **表示の ON/OFF で NotifyIcon を作り直してはいけない。** Windows はトレイアイコンを
+    /// 「exe のパス + 通し番号」で識別していて、WinForms はその番号を NotifyIcon を作った順に
+    /// 振る。作り直すと番号がずれ、`HKCU\Control Panel\NotifyIconSettings` に書いた
+    /// 「タスクバーに出す」(IsPromoted) が別のエントリに置き去りになって、
+    /// アイコンがまたオーバーフローへ引っ込んでしまう。
+    ///
+    /// 最初に全部を同じ順で作っておけば、番号は指標ごとに毎回同じになり、設定が残り続ける。
+    /// </summary>
+    private void CreateSlots()
     {
         foreach (Metric metric in _metrics)
         {
-            bool enabled = Settings.MetricEnabled(metric.Id, metric.DefaultEnabled);
+            var notify = new NotifyIcon
+            {
+                ContextMenuStrip = _menu,
+                Text = metric.Name
+            };
+            _slots[metric.Id] = new Slot { Metric = metric, Notify = notify };
+        }
+        SyncSlots();
+    }
 
-            if (enabled && !_slots.ContainsKey(metric.Id))
-            {
-                var notify = new NotifyIcon
-                {
-                    ContextMenuStrip = _menu,
-                    Text = metric.Name,
-                    Visible = _iconsVisible
-                };
-                _slots[metric.Id] = new Slot { Metric = metric, Notify = notify };
-            }
-            else if (!enabled && _slots.TryGetValue(metric.Id, out Slot? slot))
-            {
-                slot.Notify.Visible = false;
-                slot.Notify.Dispose();
-                slot.Current?.Dispose();
-                _slots.Remove(metric.Id);
-            }
+    /// <summary>どの指標を表示するかを設定から読み直す。器は作り直さず表示だけ切り替える。</summary>
+    private void SyncSlots()
+    {
+        foreach (Slot slot in _slots.Values)
+        {
+            slot.Enabled = Settings.MetricEnabled(slot.Metric.Id, slot.Metric.DefaultEnabled);
+            slot.Notify.Visible = slot.Enabled && _iconsVisible;
         }
     }
+
+    private IEnumerable<Slot> ActiveSlots => _slots.Values.Where(s => s.Enabled);
+
+    private int EnabledCount => _slots.Values.Count(s => s.Enabled);
 
     // ----- 毎秒の更新 -----------------------------------------------------
 
     private void Update()
     {
         if (_tick++ % 5 == 0)
-            foreach (Slot slot in _slots.Values) slot.Metric.Refresh();
+            foreach (Slot slot in ActiveSlots) slot.Metric.Refresh();
 
-        // exe をもう一度起動した場合の「出てきて」要求
+        // exe をもう一度起動した場合の「出てきて」要求。
+        // わざわざ起動し直したということは見失っている可能性が高いので、
+        // アイコンを出すだけでなく設定画面も開いて「ここにいる」と分かるようにする。
         if (_showRequest.WaitOne(0))
         {
             _forceShow = true;
             _forceHide = false;
+            _pendingSettings = true;
         }
 
         var samples = new Dictionary<string, Sample>();
         double peak = 0;
-        foreach (Slot slot in _slots.Values)
+        foreach (Slot slot in ActiveSlots)
         {
             Sample sample = slot.Metric.Read();
             samples[slot.Metric.Id] = sample;
@@ -471,7 +523,7 @@ internal sealed class MeterContext : ApplicationContext
         if (!_iconsVisible) return;
 
         bool blink = _tick % 9 == 0;
-        foreach (Slot slot in _slots.Values)
+        foreach (Slot slot in ActiveSlots)
         {
             Sample sample = samples[slot.Metric.Id];
             Color color = Settings.MetricColor(slot.Metric.Id, slot.Metric.DefaultColor);
@@ -505,7 +557,7 @@ internal sealed class MeterContext : ApplicationContext
             return;
         }
 
-        var tracked = _slots.Values
+        var tracked = ActiveSlots
             .Select(slot => new TrackedMetric(
                 slot.Metric.Id,
                 slot.Metric.Name,
@@ -614,13 +666,31 @@ internal sealed class MeterContext : ApplicationContext
         }
 
         _iconsVisible = visible;
-        foreach (Slot slot in _slots.Values) slot.Notify.Visible = visible;
+        foreach (Slot slot in _slots.Values) slot.Notify.Visible = visible && slot.Enabled;
     }
 
     private void Notify(string message, ToolTipIcon icon, string title = "TaskbarMeter")
     {
-        Slot? first = _slots.Values.FirstOrDefault();
+        Slot? first = ActiveSlots.FirstOrDefault();
         first?.Notify.ShowBalloonTip(5000, title, message, icon);
+    }
+
+    /// <summary>
+    /// 終了する前に、戻しかたを見せる。
+    /// 終了するとタスクバーから消え、Ctrl+Alt+M も効かなくなる（常駐していないので当然）。
+    /// exe の置き場所を覚えていないと戻せなくなるため、ここで道筋を示しておく。
+    /// </summary>
+    private void ConfirmQuit()
+    {
+        string howToReturn = StartMenuShortcut.Exists
+            ? "また使うときは、スタートメニューで「TaskbarMeter」と検索してください。"
+            : $"また使うときは、この場所の exe をダブルクリックしてください。\n\n{Environment.ProcessPath}";
+
+        DialogResult answer = MessageBox.Show(
+            $"TaskbarMeter を終了します。\n\n{howToReturn}",
+            "TaskbarMeter", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+
+        if (answer == DialogResult.OK) Quit();
     }
 
     private void Quit()
@@ -2131,6 +2201,8 @@ internal sealed class SetupForm : Form
 
         button.Click += (_, _) =>
         {
+            // 希望を覚えておく。Windows 側の設定は消えることがあるので毎回掛け直す。
+            Settings.PromoteTray = true;
             bool ok = TrayPromotion.Promote();
             _apply();
             result.ForeColor = ok ? Color.FromArgb(130, 230, 160) : Color.FromArgb(255, 190, 120);
@@ -2156,13 +2228,43 @@ internal sealed class SetupForm : Form
 
     private int BuildFooter(int y, bool firstRun)
     {
+        y = SectionTitle(y, "④ 見失わないために");
+
+        // 終了するとタスクバーから消える。exe の場所を覚えていない人は戻せなくなるので、
+        // スタートメニューから探せるようにしておく。初回は既定でオンにしている。
+        var startMenu = new CheckBox
+        {
+            Text = "スタートメニューに追加する（終了しても探し出せます）",
+            Checked = StartMenuShortcut.Exists,
+            ForeColor = Color.White,
+            AutoSize = false,
+            Bounds = new Rectangle(Gutter, y, 440, 24)
+        };
+        startMenu.CheckedChanged += (_, _) =>
+        {
+            if (_syncing) return;
+
+            if (!startMenu.Checked) { StartMenuShortcut.Remove(); return; }
+            if (StartMenuShortcut.Create()) return;
+
+            _syncing = true;
+            startMenu.Checked = false;
+            _syncing = false;
+            MessageBox.Show(this,
+                "スタートメニューに追加できませんでした。\n" +
+                "exe の場所をメモしておくか、右クリックで「送る」→「デスクトップ」を使ってください。",
+                "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        };
+        Controls.Add(startMenu);
+        y += 28;
+
         var autoStart = new CheckBox
         {
             Text = "Windows を起動したら自動で始める",
             Checked = AutoStart.IsEnabled,
             ForeColor = Color.White,
             AutoSize = false,
-            Bounds = new Rectangle(Gutter, y, 300, 24)
+            Bounds = new Rectangle(Gutter, y, 440, 24)
         };
         autoStart.CheckedChanged += (_, _) =>
         {
@@ -2170,19 +2272,20 @@ internal sealed class SetupForm : Form
             AutoStart.Set(autoStart.Checked);
         };
         Controls.Add(autoStart);
+        y += 34;
 
         var close = new Button
         {
             Text = firstRun ? "使いはじめる" : "閉じる",
             DialogResult = DialogResult.OK,
             FlatStyle = FlatStyle.System,
-            Bounds = new Rectangle(528 - Gutter - 130, y - 4, 130, 32)
+            Bounds = new Rectangle(528 - Gutter - 130, y, 130, 32)
         };
         Controls.Add(close);
         AcceptButton = close;
         CancelButton = close;
 
-        return y + 34;
+        return y + 38;
     }
 
     // ----- プレビュー -----------------------------------------------------
@@ -2666,6 +2769,16 @@ internal static class Settings
         set => Write("SetupDone", value ? 1 : 0);
     }
 
+    /// <summary>
+    /// 「タスクバーに出す」を使うか。Windows 側の設定は消えることがあるので、
+    /// 希望を覚えておいて起動のたびに掛け直す。
+    /// </summary>
+    public static bool PromoteTray
+    {
+        get => Read("PromoteTray", 0) == 1;
+        set => Write("PromoteTray", value ? 1 : 0);
+    }
+
     public static bool MetricEnabled(string id, bool fallback)
         => Read($"Metric_{id}_On", fallback ? 1 : 0) == 1;
 
@@ -2770,6 +2883,64 @@ internal static class TrayPromotion
             return promoted;
         }
         catch { return false; }
+    }
+}
+
+/// <summary>
+/// スタートメニューへのショートカット。
+///
+/// 「終了」したあと戻せなくなるのを防ぐための仕掛け。exe は bin の奥や
+/// ダウンロードフォルダにあることが多く、配布相手は場所を覚えていない。
+/// スタートメニューに置いておけば、スタートボタンから "taskbar" と打つだけで戻せる。
+///
+/// ショートカット (.lnk) の作成は COM の WScript.Shell に任せる。
+/// 参照を増やしたくないので、型は ProgID から遅延バインドで取っている。
+/// </summary>
+internal static class StartMenuShortcut
+{
+    private static string LinkPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.Programs), "TaskbarMeter.lnk");
+
+    public static bool Exists
+    {
+        get { try { return File.Exists(LinkPath); } catch { return false; } }
+    }
+
+    public static bool Create()
+    {
+        try
+        {
+            string? exe = Environment.ProcessPath;
+            if (exe is null) return false;
+
+            Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType is null) return false;
+
+            object? shell = Activator.CreateInstance(shellType);
+            if (shell is null) return false;
+
+            object? link = shellType.InvokeMember("CreateShortcut",
+                BindingFlags.InvokeMethod, null, shell, new object[] { LinkPath });
+            if (link is null) return false;
+
+            Type linkType = link.GetType();
+            void Set(string name, string value) => linkType.InvokeMember(
+                name, BindingFlags.SetProperty, null, link, new object[] { value });
+
+            Set("TargetPath", exe);
+            Set("WorkingDirectory", Path.GetDirectoryName(exe) ?? "");
+            Set("Description", "タスクバーに CPU や GPU の使用率を表示する");
+            linkType.InvokeMember("Save", BindingFlags.InvokeMethod, null, link, null);
+
+            return File.Exists(LinkPath);
+        }
+        catch { return false; }
+    }
+
+    public static void Remove()
+    {
+        try { if (File.Exists(LinkPath)) File.Delete(LinkPath); }
+        catch { /* 消せなくても実害はない */ }
     }
 }
 
