@@ -56,9 +56,7 @@ internal readonly record struct Sample(
 /// </summary>
 /// <param name="Tick">起動からの秒数。まばたきの位相に使う。</param>
 /// <param name="Recording">計測中か。</param>
-/// <param name="OthersBusy">自分以外に限界近くまで働いている指標があるか。</param>
-internal readonly record struct IconMood(
-    int Tick = 0, bool Recording = false, bool OthersBusy = false);
+internal readonly record struct IconMood(int Tick = 0, bool Recording = false);
 
 // ---------------------------------------------------------------------------
 //  本体
@@ -140,12 +138,12 @@ internal sealed class MeterContext : ApplicationContext
         _timer.Interval = 1000;
         _timer.Tick += (_, _) =>
         {
-            Update();
-
             // セットアップ／設定画面はここで開く。コンストラクタ（= Application.Run の前）で
             // モーダルを出すと動作が不安定なので、メッセージループが回り始めてからにする。
-            // アイコンが 1 秒ぶん表示済みになるため、「タスクバーに出す」が参照する
-            // レジストリのエントリが用意できている、という意味でも都合がよい。
+            //
+            // Update() より先に見ているのが要点。初回起動では GPU のカウンタを組み立てるのに
+            // 1 秒近くかかり、そのあいだ画面には何も出ない。先に案内画面を出しておけば、
+            // 待たされている感じがなくなる。アイコンの更新はこの画面を開いたまま続く。
             if (_pendingSetup)
             {
                 _pendingSetup = false;
@@ -169,9 +167,16 @@ internal sealed class MeterContext : ApplicationContext
                 if (TrayPromotion.Promote()) _promoteTries = 0;
                 else _promoteTries--;
             }
+
+            Update();
         };
+
+        _pendingSetup = !Settings.SetupDone;
         _timer.Start();
-        Update();
+
+        // 初回はここで計測を始めない。カウンタの組み立てに時間がかかり、
+        // その間なにも出ないまま待たされるため、先に案内画面を出す。
+        if (!_pendingSetup) Update();
 
         if (!_hotkey.Registered)
         {
@@ -180,8 +185,6 @@ internal sealed class MeterContext : ApplicationContext
             Notify("Ctrl+Alt+M が他のアプリと競合しており登録できませんでした。" +
                    "「高負荷のときだけ表示」は無効にしています。", ToolTipIcon.Warning);
         }
-
-        _pendingSetup = !Settings.SetupDone;
     }
 
     // ----- メニュー -------------------------------------------------------
@@ -547,22 +550,11 @@ internal sealed class MeterContext : ApplicationContext
         SetVisible(shouldShow);
         if (!_iconsVisible) return;
 
-        // 「自分以外でいちばん働いている指標」を知るために上位 2 つを控えておく。
-        // 自分が 1 位なら 2 位が、そうでなければ 1 位が「隣の忙しさ」になる。
-        double top1 = 0, top2 = 0;
-        foreach (Sample s in samples.Values)
-        {
-            if (s.Ratio > top1) { top2 = top1; top1 = s.Ratio; }
-            else if (s.Ratio > top2) { top2 = s.Ratio; }
-        }
-
+        var mood = new IconMood(_tick, _recorder.Recording);
         foreach (Slot slot in ActiveSlots)
         {
             Sample sample = samples[slot.Metric.Id];
             Color color = Settings.MetricColor(slot.Metric.Id, slot.Metric.DefaultColor);
-
-            double othersPeak = sample.Ratio >= top1 ? top2 : top1;
-            var mood = new IconMood(_tick, _recorder.Recording, othersPeak >= 0.80);
 
             IconStyle style = _style == IconStyle.Image && _skin is null ? IconStyle.Face : _style;
             Icon fresh = IconFactory.Create(sample.Ratio, sample.Text, color, style,
@@ -815,11 +807,12 @@ internal abstract class Metric : IDisposable
 
     public virtual void Dispose() { }
 
+    /// <summary>
+    /// 0〜100 の整数文字列。100 もそのまま返す
+    /// （アイコン側が 3 桁を細い字形で描けるようになったため丸めない）。
+    /// </summary>
     protected static string Percent(double ratio)
-    {
-        int value = (int)Math.Round(Math.Clamp(ratio, 0, 1) * 100);
-        return value >= 100 ? "99" : value.ToString();
-    }
+        => ((int)Math.Round(Math.Clamp(ratio, 0, 1) * 100)).ToString();
 
     /// <summary>アイコンに収まる短い数値表記。</summary>
     protected static string Compact(double value) => value switch
@@ -1227,6 +1220,27 @@ internal static class IconFactory
         ['-'] = new[] { "...", "...", "...", "...", "###", "...", "...", "...", "..." }
     };
 
+    /// <summary>
+    /// 3 文字用の細い字形（幅 4）。"100" は 5 幅では 16 に入らず、字間を詰めると
+    /// 0 と 0 がくっついて 1 文字に見えてしまうため、桁数が増えたらこちらに切り替える。
+    /// </summary>
+    private static readonly Dictionary<char, string[]> NarrowGlyphs = new()
+    {
+        ['0'] = new[] { ".##.", "#..#", "#..#", "#..#", "#..#", "#..#", "#..#", "#..#", ".##." },
+        ['1'] = new[] { ".#..", "##..", ".#..", ".#..", ".#..", ".#..", ".#..", ".#..", "###." },
+        ['2'] = new[] { ".##.", "#..#", "...#", "...#", "..#.", ".#..", "#...", "#...", "####" },
+        ['3'] = new[] { "###.", "...#", "...#", "..#.", ".##.", "...#", "...#", "#..#", ".##." },
+        ['4'] = new[] { "..#.", ".##.", "#.#.", "#.#.", "####", "..#.", "..#.", "..#.", "..#." },
+        ['5'] = new[] { "####", "#...", "#...", "###.", "...#", "...#", "...#", "#..#", ".##." },
+        ['6'] = new[] { ".##.", "#...", "#...", "###.", "#..#", "#..#", "#..#", "#..#", ".##." },
+        ['7'] = new[] { "####", "...#", "...#", "..#.", "..#.", ".#..", ".#..", ".#..", ".#.." },
+        ['8'] = new[] { ".##.", "#..#", "#..#", "#..#", ".##.", "#..#", "#..#", "#..#", ".##." },
+        ['9'] = new[] { ".##.", "#..#", "#..#", "#..#", ".###", "...#", "...#", "...#", ".##." },
+        ['.'] = new[] { "..", "..", "..", "..", "..", "..", "..", "##", "##" },
+        ['+'] = new[] { "...", "...", "...", ".#.", "###", ".#.", "...", "...", "..." },
+        ['-'] = new[] { "...", "...", "...", "...", "###", "...", "...", "...", "..." }
+    };
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DestroyIcon(IntPtr handle);
@@ -1331,12 +1345,6 @@ internal static class IconFactory
         bool blink = mood.Tick % 9 == 0;
         bool closedEyes = stage == 0 || (blink && stage is 1 or 2);
 
-        // 自分は暇なのに、隣で誰かが限界まで働いている状態。
-        // 眠るのではなく「待ちぼうけ」の顔にする。かわいさのためだけでなく、
-        // GPU が待ちぼうけ + CPU が限界 = データ供給待ち、と読めるようにするため。
-        bool waiting = stage == 0 && mood.OthersBusy;
-        if (waiting) closedEyes = false;
-
         void Set(int y, int x, char c)
         {
             if (y is >= 0 and < G && x is >= 0 and < G) grid[y][x] = c;
@@ -1362,14 +1370,6 @@ internal static class IconFactory
             Pair(5, 3, 'K'); Pair(5, 5, 'K');
             Pair(6, 4, 'K');
             Pair(7, 3, 'K'); Pair(7, 5, 'K');
-        }
-        else if (waiting)
-        {
-            // よそ見。ここだけは Pair を使わない。左右対称にずらすと目が離れて
-            // 驚き顔になってしまうので、両目とも同じ向きへずらす必要がある。
-            OvalEye(2, 5);
-            OvalEye(9, 5);
-            Set(6, 2, 'W'); Set(6, 9, 'W');
         }
         else if (closedEyes)
         {
@@ -1423,13 +1423,7 @@ internal static class IconFactory
         }
 
         // ----- 付属物 -----
-        if (waiting)
-        {
-            // 「…」。隣り合わせると 1 本の白い棒に見えてしまうので 1 ドットずつ空ける。
-            // 頭の輪郭を避けられる y=0 なら 3 つ並べる幅がある。
-            Set(0, 11, 'W'); Set(0, 13, 'W'); Set(0, 15, 'W');
-        }
-        else if (stage == 0)
+        if (stage == 0)
         {
             // zzz
             Set(0, 13, 'W'); Set(0, 14, 'W'); Set(0, 15, 'W');
@@ -1462,12 +1456,14 @@ internal static class IconFactory
     {
         char[][] grid = EmptyGrid();
 
-        List<string[]> glyphs = text.Where(Glyphs.ContainsKey).Select(c => Glyphs[c]).ToList();
-        if (glyphs.Count == 0) glyphs.Add(Glyphs['-']);
+        // 3 文字以上は細い字形に切り替える。太いままだと "100" が 16 に収まらない。
+        Dictionary<char, string[]> font =
+            text.Count(Glyphs.ContainsKey) >= 3 ? NarrowGlyphs : Glyphs;
+
+        List<string[]> glyphs = text.Where(font.ContainsKey).Select(c => font[c]).ToList();
+        if (glyphs.Count == 0) glyphs.Add(font['-']);
 
         // 字間は 1 ドット。字そのものが 16 に入らないときだけ 0 に詰める。
-        // 縁取りぶんまで数えて詰めると "99+" の 9 と 9 がくっついて 1 文字に見えてしまうので、
-        // 端の縁取りが欠けるほうを許容している。
         int sum = glyphs.Sum(gl => gl[0].Length);
         int gap = sum + (glyphs.Count - 1) <= G ? 1 : 0;
         int width = sum + gap * (glyphs.Count - 1);
@@ -1856,47 +1852,77 @@ internal sealed class SkinPreviewForm : Form
         Rebuild();
 
         Text = "アイコンの作成";
-        ClientSize = new Size(420, 620);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        Font = new Font("Yu Gothic UI", 9.5f);
+        AutoScaleMode = AutoScaleMode.Font;
+        FormBorderStyle = FormBorderStyle.Sizable;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.FromArgb(32, 32, 36);
         ForeColor = Color.White;
 
-        _preview.Size = new Size(PreviewBox, PreviewBox);
-        _preview.Location = new Point((ClientSize.Width - PreviewBox) / 2, 16);
-        _preview.Paint += (_, e) => DrawZoomed(e.Graphics);
-        Controls.Add(_preview);
+        // 設定画面と同じ理由で、座標を数値で置かない。
+        // 拡大表示のとき文字だけ大きくなって重なるため、並べ方は入れ物に任せる。
+        int unit = Math.Max(16, Font.Height);
 
-        var actualLabel = new Label
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            AutoSize = true,
+            Padding = new Padding(unit),
+            BackColor = BackColor
+        };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        void Row(Control c)
+        {
+            root.Controls.Add(c);
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
+
+        _preview.Size = new Size(PreviewBox, PreviewBox);
+        _preview.Anchor = AnchorStyles.None;   // セル内で中央になる
+        _preview.Margin = new Padding(0, 0, 0, unit / 2);
+        _preview.Paint += (_, e) => DrawZoomed(e.Graphics);
+        Row(_preview);
+
+        Row(new Label
         {
             Text = "実際の大きさ（16 / 24 / 32 px）",
-            AutoSize = false,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Bounds = new Rectangle(16, _preview.Bottom + 8, ClientSize.Width - 32, 20),
+            AutoSize = true,
+            Anchor = AnchorStyles.None,
             ForeColor = Color.FromArgb(190, 255, 255, 255)
-        };
-        Controls.Add(actualLabel);
+        });
 
-        _actual.Bounds = new Rectangle((ClientSize.Width - 160) / 2, actualLabel.Bottom + 4, 160, 40);
+        _actual.Size = new Size(160, 40);
+        _actual.Anchor = AnchorStyles.None;
+        _actual.Margin = new Padding(0, 0, 0, unit);
         _actual.Paint += (_, e) => DrawActualSizes(e.Graphics);
-        Controls.Add(_actual);
+        Row(_actual);
 
-        int top = _actual.Bottom + 14;
-
-        var resolutionLabel = new Label
+        var resolutionRow = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, unit / 2)
+        };
+        resolutionRow.Controls.Add(new Label
         {
             Text = "解像度",
-            Bounds = new Rectangle(40, top + 4, 60, 24),
-            ForeColor = Color.White
-        };
-        Controls.Add(resolutionLabel);
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            ForeColor = Color.White,
+            Margin = new Padding(0, unit / 4, unit / 2, 0)
+        });
 
         var resolution = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Bounds = new Rectangle(104, top, 110, 26)
+            AutoSize = true,
+            Width = unit * 7
         };
         foreach (int value in PixelSkin.Resolutions) resolution.Items.Add($"{value} × {value}");
         resolution.SelectedIndex = Array.IndexOf(PixelSkin.Resolutions, _resolution);
@@ -1904,20 +1930,21 @@ internal sealed class SkinPreviewForm : Form
         {
             _resolution = PixelSkin.Resolutions[resolution.SelectedIndex];
             Rebuild();
-            Invalidate(true);
             _preview.Invalidate();
             _actual.Invalidate();
         };
-        Controls.Add(resolution);
+        resolutionRow.Controls.Add(resolution);
+        Row(resolutionRow);
 
-        CheckBox Add(string text, bool value, Action<bool> apply, int offset)
+        void Option(string text, bool value, Action<bool> apply)
         {
             var box = new CheckBox
             {
                 Text = text,
                 Checked = value,
-                Bounds = new Rectangle(40, top + offset, 320, 26),
-                ForeColor = Color.White
+                AutoSize = true,
+                ForeColor = Color.White,
+                Margin = new Padding(0, 0, 0, unit / 4)
             };
             box.CheckedChanged += (_, _) =>
             {
@@ -1926,32 +1953,53 @@ internal sealed class SkinPreviewForm : Form
                 _preview.Invalidate();
                 _actual.Invalidate();
             };
-            Controls.Add(box);
-            return box;
+            Row(box);
         }
 
-        Add("背景を自動で透明にする", _removeBackground, v => _removeBackground = v, 34);
-        Add("色を減らしてドット絵っぽくする", _posterize, v => _posterize = v, 62);
-        Add("なめらかに表示する（オフでドットがくっきり）", Smooth, v => Smooth = v, 90);
+        Option("背景を自動で透明にする", _removeBackground, v => _removeBackground = v);
+        Option("色を減らしてドット絵っぽくする", _posterize, v => _posterize = v);
+        Option("なめらかに表示する（オフでドットがくっきり）", Smooth, v => Smooth = v);
 
-        var ok = new Button
+        var buttons = new FlowLayoutPanel
         {
-            Text = "これにする",
-            DialogResult = DialogResult.OK,
-            Bounds = new Rectangle(ClientSize.Width - 250, top + 126, 110, 34),
-            FlatStyle = FlatStyle.System
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false,
+            Anchor = AnchorStyles.Right,
+            Margin = new Padding(0, unit / 2, 0, 0)
         };
         var cancel = new Button
         {
             Text = "やめる",
             DialogResult = DialogResult.Cancel,
-            Bounds = new Rectangle(ClientSize.Width - 130, top + 126, 110, 34),
-            FlatStyle = FlatStyle.System
+            FlatStyle = FlatStyle.System,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(unit * 5, unit * 2)
         };
-        Controls.Add(ok);
-        Controls.Add(cancel);
+        var ok = new Button
+        {
+            Text = "これにする",
+            DialogResult = DialogResult.OK,
+            FlatStyle = FlatStyle.System,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(unit * 5, unit * 2),
+            Margin = new Padding(unit / 2, 0, 0, 0)
+        };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(ok);
+        Row(buttons);
+
+        Controls.Add(root);
         AcceptButton = ok;
         CancelButton = cancel;
+
+        Size wanted = root.GetPreferredSize(Size.Empty);
+        Rectangle screen = Screen.FromPoint(Cursor.Position).WorkingArea;
+        ClientSize = new Size(Math.Min(wanted.Width, screen.Width - unit * 4),
+                              Math.Min(wanted.Height, screen.Height - unit * 6));
     }
 
     private void Rebuild()
@@ -2007,20 +2055,20 @@ internal sealed class SkinPreviewForm : Form
 /// <summary>
 /// 初回起動の案内と、ふだんの設定を兼ねる 1 枚の画面。
 /// 右クリックメニューでも同じことはできるが、初めての人にメニューを探させないために、
-/// 「表示する項目・見た目・タスクバーに出す・自動起動」をここに集めてある。
+/// 「表示する項目・見た目・タスクバーに出す・見失わないために」をここに集めてある。
 ///
 /// 変更はその場で保存して apply を呼ぶので、トレイのアイコンが即座に変わる。
-/// 自分がいま何を設定しているのかが目で見て分かるようにするため。
+///
+/// **座標を数値で置かないこと。** 画面の拡大率（125% / 150% など）が上がると文字だけが
+/// 大きくなり、手で決めた枠から溢れて重なる。実際にノート PC で崩れた。
+/// 位置と大きさは TableLayoutPanel と AutoSize に任せ、余白だけ文字の高さを基準に決める。
 /// </summary>
 internal sealed class SetupForm : Form
 {
     private static readonly Color Back = Color.FromArgb(30, 30, 36);
     private static readonly Color Card = Color.FromArgb(42, 42, 50);
-    private static readonly Color Faint = Color.FromArgb(175, 255, 255, 255);
+    private static readonly Color Faint = Color.FromArgb(180, 255, 255, 255);
     private static readonly Color Accent = Color.FromArgb(120, 200, 255);
-
-    private const int Gutter = 24;
-    private const int Swatch = 32;   // プレビューアイコンの一辺
 
     private readonly List<Metric> _metrics;
     private readonly Action _apply;
@@ -2029,13 +2077,15 @@ internal sealed class SetupForm : Form
 
     private readonly List<CheckBox> _metricBoxes = new();
     private readonly List<Panel> _previews = new();
+    private readonly List<(IconStyle Style, RadioButton Button)> _styleButtons = new();
     private bool _syncing;
 
-    /// <summary>
-    /// 本文。画面の縦が足りない環境ではここだけスクロールさせ、
-    /// 下のボタンは必ず見えるようにする（1366x768 のノートで押せなくなるのを防ぐ）。
-    /// </summary>
-    private readonly Panel _body = new() { AutoScroll = true };
+    private readonly TableLayoutPanel _body = new();
+
+    /// <summary>文字の高さを基準寸法にする。拡大率が変わればこれも変わる。</summary>
+    private int Unit => Math.Max(16, Font.Height);
+
+    private int Swatch => Unit * 2;   // プレビューアイコンの一辺
 
     public SetupForm(List<Metric> metrics, bool firstRun, Action apply,
                      Func<PixelSkin?> skin, Action chooseImage)
@@ -2049,36 +2099,458 @@ internal sealed class SetupForm : Form
         BackColor = Back;
         ForeColor = Color.White;
         Font = new Font("Yu Gothic UI", 9.5f);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
-        MinimizeBox = false;
+        AutoScaleMode = AutoScaleMode.Font;
         StartPosition = FormStartPosition.CenterScreen;
+        MinimizeBox = false;
         ShowInTaskbar = true;
 
-        const int width = 528;
-        const int barHeight = 62;
+        // 拡大率や文字サイズが想定外でも詰まないよう、縮められる窓にしておく
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MaximizeBox = true;
 
+        _body.Dock = DockStyle.Fill;
+        _body.ColumnCount = 1;
+        _body.AutoScroll = true;
         _body.BackColor = Back;
-        Controls.Add(_body);
+        _body.Padding = new Padding(Unit);
+        _body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
-        int y = Gutter;
-        y = BuildHeader(y, firstRun);
-        y = BuildMetricSection(y);
-        y = BuildStyleSection(y);
-        y = BuildTaskbarSection(y);
-        y = BuildOptions(y);
-        int content = y + Gutter;
+        Add(BuildHeader(firstRun));
+        Add(SectionTitle("① 表示する項目"));
+        Add(BuildMetricSection());
+        Add(SectionTitle("② 見た目"));
+        Add(BuildStyleSection());
+        Add(SectionTitle("③ タスクバーに出す"));
+        Add(BuildTaskbarSection());
+        Add(SectionTitle("④ 見失わないために"));
+        Add(BuildOptionSection());
 
-        // 入りきらなければ本文を縮めてスクロールさせる。ドッキングは並び順で
-        // 挙動が変わって分かりにくいので、位置は明示的に置いている。
-        int room = (Screen.FromPoint(Cursor.Position)?.WorkingArea.Height ?? 900) - 120 - barHeight;
-        int bodyHeight = Math.Max(320, Math.Min(content, room));
+        Control bar = BuildButtonBar(firstRun);
 
-        _body.Bounds = new Rectangle(0, 0, width, bodyHeight);
-        Controls.Add(BuildButtonBar(firstRun, width, bodyHeight, barHeight));
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Back
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.Controls.Add(_body, 0, 0);
+        root.Controls.Add(bar, 0, 1);
+        Controls.Add(root);
 
-        ClientSize = new Size(width, bodyHeight + barHeight);
+        // 幅は中身に決めさせる。数値で決め打つと、拡大表示のときに
+        // 文字だけ大きくなって「GPU 使用率 (学」のように切れる。
+        Rectangle screen = Screen.FromPoint(Cursor.Position).WorkingArea;
+        Size natural = _body.GetPreferredSize(Size.Empty);
+        int width = Math.Clamp(natural.Width + Unit, Unit * 22, screen.Width - Unit * 4);
+
+        // 高さはその幅で折り返した結果から。入りきらないぶんは本文をスクロールさせる
+        // （ボタンは常に見える）。
+        int barHeight = bar.GetPreferredSize(new Size(width, 0)).Height;
+        int contentHeight = _body.GetPreferredSize(new Size(width, 0)).Height;
+        int maxBody = screen.Height - barHeight - Unit * 6;
+
+        ClientSize = new Size(width,
+            Math.Max(Unit * 14, Math.Min(contentHeight, maxBody)) + barHeight);
+        MinimumSize = new Size(Unit * 18, Unit * 12);
     }
+
+    private void Add(Control section)
+    {
+        section.Dock = DockStyle.Top;
+        section.AutoSize = true;
+        _body.Controls.Add(section);
+        _body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+    }
+
+    /// <summary>折り返しつきの説明文。幅は親に合わせ、高さは中身から決まる。</summary>
+    private Label Para(string text, Color color, bool bold = false, float scale = 1f)
+    {
+        var label = new Label
+        {
+            Text = text,
+            ForeColor = color,
+            AutoSize = true,
+            MaximumSize = new Size(Unit * 24, 0),   // ここで折り返す
+            Margin = new Padding(0, 0, 0, Unit / 3)
+        };
+        if (bold || scale != 1f)
+            label.Font = new Font(Font.FontFamily, Font.Size * scale,
+                                  bold ? FontStyle.Bold : FontStyle.Regular);
+        return label;
+    }
+
+    private Control Stack(params Control[] children)
+    {
+        var panel = new TableLayoutPanel
+        {
+            ColumnCount = 1,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0),
+            BackColor = Color.Transparent
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        foreach (Control c in children)
+        {
+            panel.Controls.Add(c);
+            panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
+        return panel;
+    }
+
+    // ----- 見出し ---------------------------------------------------------
+
+    private Control BuildHeader(bool firstRun)
+        => Stack(
+            Para("TaskbarMeter", Color.White, bold: true, scale: 1.7f),
+            Para(firstRun
+                    ? "タスクバーの右下に、CPU や GPU の使用率を住まわせます。\n下の 4 つを決めるだけで使いはじめられます。"
+                    : "設定はすぐに反映されます。閉じるボタンで終わりです。",
+                 Faint));
+
+    private Control SectionTitle(string text)
+    {
+        Label label = Para(text, Accent, bold: true, scale: 1.1f);
+        label.Margin = new Padding(0, Unit, 0, Unit / 3);
+        return label;
+    }
+
+    // ----- ① 表示する項目 -------------------------------------------------
+
+    private Control BuildMetricSection()
+    {
+        // 2 列に並べる。8 項目を縦一列にすると画面が長くなりすぎるため。
+        int rows = (_metrics.Count + 1) / 2;
+        var grid = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            RowCount = rows,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0),
+            BackColor = Color.Transparent
+        };
+        // AutoSize にして、列幅は中でいちばん長い名前に合わせる。
+        // 割合で決めると、拡大表示のときに名前がはみ出して切れる。
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        for (int i = 0; i < _metrics.Count; i++)
+        {
+            Metric metric = _metrics[i];
+            grid.Controls.Add(BuildMetricRow(metric), i / rows, i % rows);
+        }
+        return grid;
+    }
+
+    private Control BuildMetricRow(Metric metric)
+    {
+        var row = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            RowCount = 1,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, 0, Unit / 2, Unit / 3),
+            BackColor = Color.Transparent
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var preview = new Panel
+        {
+            Size = new Size(Swatch, Swatch),
+            Margin = new Padding(0, 0, Unit / 2, 0),
+            BackColor = Card
+        };
+        preview.Paint += (_, e) => DrawPreview(e.Graphics, preview.ClientRectangle, 0.45, "45",
+                                               Settings.MetricColor(metric.Id, metric.DefaultColor));
+        row.Controls.Add(preview, 0, 0);
+        _previews.Add(preview);
+
+        var box = new CheckBox
+        {
+            Text = metric.ShortName,
+            Checked = Settings.MetricEnabled(metric.Id, metric.DefaultEnabled),
+            ForeColor = Color.White,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,     // セル内で縦中央になる
+            Margin = new Padding(0)
+        };
+        box.CheckedChanged += (_, _) => OnMetricToggled(box, metric);
+        row.Controls.Add(box, 1, 0);
+        _metricBoxes.Add(box);
+
+        return row;
+    }
+
+    private void OnMetricToggled(CheckBox box, Metric metric)
+    {
+        if (_syncing) return;
+
+        // 全部消すと右クリックする先が無くなり、設定に戻れなくなる
+        if (!box.Checked && _metricBoxes.Count(b => b.Checked) == 0)
+        {
+            _syncing = true;
+            box.Checked = true;
+            _syncing = false;
+            MessageBox.Show(this,
+                "最低 1 つは表示したままにしてください。\n" +
+                "アイコンが 1 つも無くなると、右クリックで設定を開けなくなります。",
+                "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        Settings.SetMetricEnabled(metric.Id, box.Checked);
+        _apply();
+    }
+
+    // ----- ② 見た目 -------------------------------------------------------
+
+    private Control BuildStyleSection()
+    {
+        var choices = new (IconStyle Style, string Label, string Note)[]
+        {
+            (IconStyle.Face, "ドット絵キャラ", "負荷で表情が変わります"),
+            (IconStyle.Number, "数字", "使用率をそのまま数字で"),
+            (IconStyle.Image, "好きな画像", "画像をドット絵に変換します")
+        };
+
+        var grid = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0),
+            BackColor = Color.Transparent
+        };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        int rowIndex = 0;
+        foreach ((IconStyle style, string label, string note) in choices)
+        {
+            IconStyle captured = style;
+
+            // 低・中・高の 3 つを並べる。負荷で見た目が変わることを言葉より早く伝えられる。
+            var strip = new Panel
+            {
+                Size = new Size(Swatch * 3 + Unit, Swatch),
+                Margin = new Padding(0, 0, Unit / 2, Unit / 3),
+                BackColor = Card
+            };
+            strip.Paint += (_, e) =>
+            {
+                Color color = _metrics[0].DefaultColor;
+                double[] samples = { 0.15, 0.55, 1.0 };
+                string[] texts = { "15", "55", "100" };
+
+                // 実際に与えられた幅から 1 つぶんの大きさを割り出す。
+                // 作ったときの寸法を覚えて描くと、あとで拡大率が変わったときに
+                // 3 つ目がはみ出して消える。
+                int pad = Math.Max(2, strip.ClientSize.Width / 40);
+                int side = Math.Min(strip.ClientSize.Height,
+                                    (strip.ClientSize.Width - pad * 4) / 3);
+                int top = (strip.ClientSize.Height - side) / 2;
+                for (int i = 0; i < 3; i++)
+                    DrawPreview(e.Graphics,
+                                new Rectangle(pad + i * (side + pad), top, side, side),
+                                samples[i], texts[i], color, captured);
+            };
+            grid.Controls.Add(strip, 0, rowIndex);
+            _previews.Add(strip);
+
+            var radio = new RadioButton
+            {
+                Text = label,
+                Checked = Settings.Style == captured,
+                ForeColor = Color.White,
+                AutoSize = true,
+                Margin = new Padding(0)
+            };
+            radio.CheckedChanged += (_, _) => OnStyleChosen(radio, captured);
+            _styleButtons.Add((captured, radio));
+
+            grid.Controls.Add(Stack(radio, Para(note, Faint)), 1, rowIndex);
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            rowIndex++;
+        }
+
+        var change = new Button
+        {
+            Text = "画像を選び直す…",
+            FlatStyle = FlatStyle.System,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, Unit / 3, 0, 0)
+        };
+        change.Click += (_, _) => { _chooseImage(); RefreshPreviews(); };
+
+        return Stack(grid, change);
+    }
+
+    private void OnStyleChosen(RadioButton radio, IconStyle style)
+    {
+        if (_syncing || !radio.Checked) return;
+
+        // 画像がまだ無いのに「好きな画像」を選ばれたら、先に画像を作ってもらう。
+        // 途中でやめられたら、選択を元の見た目に戻す。
+        if (style == IconStyle.Image && _skin() is null)
+        {
+            _chooseImage();
+            if (_skin() is null) { SyncStyleButtons(); return; }
+        }
+
+        Settings.Style = style;
+        _apply();
+        RefreshPreviews();
+    }
+
+    private void SyncStyleButtons()
+    {
+        _syncing = true;
+        try
+        {
+            foreach ((IconStyle style, RadioButton button) in _styleButtons)
+                button.Checked = Settings.Style == style;
+        }
+        finally { _syncing = false; }
+    }
+
+    // ----- ③ タスクバーに出す ---------------------------------------------
+
+    private Control BuildTaskbarSection()
+    {
+        var button = new Button
+        {
+            Text = "タスクバーに出す",
+            FlatStyle = FlatStyle.System,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, 0, Unit / 2, 0),
+            Enabled = TrayPromotion.Supported
+        };
+
+        Label result = Para(
+            TrayPromotion.Supported ? "" : "この Windows では下の手順で出してください。", Faint);
+        result.Anchor = AnchorStyles.Left;
+
+        button.Click += (_, _) =>
+        {
+            // 希望を覚えておく。Windows 側の設定は消えることがあるので毎回掛け直す。
+            Settings.PromoteTray = true;
+            bool ok = TrayPromotion.Promote();
+            _apply();
+            result.ForeColor = ok ? Color.FromArgb(130, 230, 160) : Color.FromArgb(255, 190, 120);
+            // 失敗しても常駐側が数十秒は試し続けるので、言い切らずに待ってもらう
+            result.Text = ok ? "出しました。" : "少し待ってください。変わらなければ下の手順で。";
+        };
+
+        var line = new TableLayoutPanel
+        {
+            ColumnCount = 2,
+            RowCount = 1,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, 0, 0, Unit / 3),
+            BackColor = Color.Transparent
+        };
+        line.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        line.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        line.Controls.Add(button, 0, 0);
+        line.Controls.Add(result, 1, 0);
+
+        return Stack(
+            Para("Windows 11 は新しいアイコンを、最初は「∧」ボタンの中に隠します。\n" +
+                 "下のボタンで表に出せます。", Faint),
+            line,
+            Para("うまくいかないときは、タスクバー右下の「∧」を押して、\n" +
+                 "出てきたアイコンをタスクバーへドラッグしてください。", Faint));
+    }
+
+    // ----- ④ 見失わないために ---------------------------------------------
+
+    private Control BuildOptionSection()
+    {
+        // 終了するとタスクバーから消える。exe の場所を覚えていない人は戻せなくなるので、
+        // スタートメニューから探せるようにしておく。
+        var startMenu = new CheckBox
+        {
+            Text = "スタートメニューに追加する（終了しても探し出せます）",
+            Checked = StartMenuShortcut.Exists,
+            ForeColor = Color.White,
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, Unit / 4)
+        };
+        startMenu.CheckedChanged += (_, _) =>
+        {
+            if (_syncing) return;
+
+            if (!startMenu.Checked) { StartMenuShortcut.Remove(); return; }
+            if (StartMenuShortcut.Create()) return;
+
+            _syncing = true;
+            startMenu.Checked = false;
+            _syncing = false;
+            MessageBox.Show(this,
+                "スタートメニューに追加できませんでした。\n" +
+                "exe の場所をメモしておくか、右クリックで「送る」→「デスクトップ」を使ってください。",
+                "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        };
+
+        var autoStart = new CheckBox
+        {
+            Text = "Windows を起動したら自動で始める",
+            Checked = AutoStart.IsEnabled,
+            ForeColor = Color.White,
+            AutoSize = true,
+            Margin = new Padding(0)
+        };
+        autoStart.CheckedChanged += (_, _) =>
+        {
+            if (_syncing) return;
+            AutoStart.Set(autoStart.Checked);
+        };
+
+        return Stack(startMenu, autoStart);
+    }
+
+    // ----- 下段 -----------------------------------------------------------
+
+    /// <summary>本文の下に固定する帯。スクロールしてもボタンが隠れないようにする。</summary>
+    private Control BuildButtonBar(bool firstRun)
+    {
+        var bar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(Unit, Unit / 2, Unit, Unit / 2),
+            BackColor = Card
+        };
+
+        var close = new Button
+        {
+            Text = firstRun ? "使いはじめる" : "閉じる",
+            DialogResult = DialogResult.OK,
+            FlatStyle = FlatStyle.System,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(Unit * 6, Unit * 2),
+            Margin = new Padding(0)
+        };
+        bar.Controls.Add(close);
+        AcceptButton = close;
+        CancelButton = close;
+
+        return bar;
+    }
+
+    // ----- 前面に出す -----------------------------------------------------
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
@@ -2126,358 +2598,6 @@ internal sealed class SetupForm : Form
         {
             if (attached) AttachThreadInput(ours, theirs, false);
         }
-    }
-
-    // ----- 見出し ---------------------------------------------------------
-
-    private int BuildHeader(int y, bool firstRun)
-    {
-        _body.Controls.Add(new Label
-        {
-            Text = "TaskbarMeter",
-            Font = new Font("Yu Gothic UI", 16f, FontStyle.Bold),
-            ForeColor = Color.White,
-            AutoSize = true,
-            Location = new Point(Gutter, y)
-        });
-        y += 32;
-
-        _body.Controls.Add(new Label
-        {
-            Text = firstRun
-                ? "タスクバーの右下に、CPU や GPU の使用率を住まわせます。\n下の 4 つを決めるだけで使いはじめられます。"
-                : "設定はすぐに反映されます。閉じるボタンで終わりです。",
-            ForeColor = Faint,
-            AutoSize = false,
-            Size = new Size(470, 40),
-            Location = new Point(Gutter, y)
-        });
-        return y + 48;
-    }
-
-    private int SectionTitle(int y, string text)
-    {
-        _body.Controls.Add(new Label
-        {
-            Text = text,
-            Font = new Font("Yu Gothic UI", 10.5f, FontStyle.Bold),
-            ForeColor = Accent,
-            AutoSize = true,
-            Location = new Point(Gutter, y)
-        });
-        return y + 26;
-    }
-
-    // ----- ① 表示する項目 -------------------------------------------------
-
-    private int BuildMetricSection(int y)
-    {
-        y = SectionTitle(y, "① 表示する項目");
-
-        // 2 列に並べる。8 項目を縦一列にすると画面が長くなりすぎるため。
-        const int colWidth = 240;
-        int rows = (_metrics.Count + 1) / 2;
-
-        for (int i = 0; i < _metrics.Count; i++)
-        {
-            Metric metric = _metrics[i];
-            int col = i / rows, row = i % rows;
-            int x = Gutter + col * colWidth;
-            int top = y + row * 30;
-
-            var preview = new Panel
-            {
-                Bounds = new Rectangle(x, top, Swatch, Swatch),
-                BackColor = Card
-            };
-            preview.Paint += (_, e) => DrawPreview(e.Graphics, preview.ClientRectangle, 0.45, "45",
-                                                   Settings.MetricColor(metric.Id, metric.DefaultColor));
-            _body.Controls.Add(preview);
-            _previews.Add(preview);
-
-            var box = new CheckBox
-            {
-                Text = metric.ShortName,
-                Checked = Settings.MetricEnabled(metric.Id, metric.DefaultEnabled),
-                ForeColor = Color.White,
-                AutoSize = false,
-                Bounds = new Rectangle(x + Swatch + 8, top + 6, colWidth - Swatch - 16, 22),
-                Tag = metric
-            };
-            box.CheckedChanged += (_, _) => OnMetricToggled(box, metric);
-            _body.Controls.Add(box);
-            _metricBoxes.Add(box);
-        }
-
-        return y + rows * 30 + 10;
-    }
-
-    private void OnMetricToggled(CheckBox box, Metric metric)
-    {
-        if (_syncing) return;
-
-        // 全部消すと右クリックする先が無くなり、設定に戻れなくなる
-        if (!box.Checked && _metricBoxes.Count(b => b.Checked) == 0)
-        {
-            _syncing = true;
-            box.Checked = true;
-            _syncing = false;
-            MessageBox.Show(this,
-                "最低 1 つは表示したままにしてください。\n" +
-                "アイコンが 1 つも無くなると、右クリックで設定を開けなくなります。",
-                "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        Settings.SetMetricEnabled(metric.Id, box.Checked);
-        _apply();
-    }
-
-    // ----- ② 見た目 -------------------------------------------------------
-
-    private int BuildStyleSection(int y)
-    {
-        y = SectionTitle(y, "② 見た目");
-
-        var choices = new (IconStyle Style, string Label, string Note)[]
-        {
-            (IconStyle.Face, "ドット絵キャラ", "負荷で表情が変わります"),
-            (IconStyle.Number, "数字", "使用率をそのまま数字で"),
-            (IconStyle.Image, "好きな画像", "画像をドット絵に変換します")
-        };
-
-        // ラジオを設定の値に合わせ直す。画像を選ぶのをやめたときに元へ戻すのに使う。
-        var buttons = new List<(IconStyle Style, RadioButton Button)>();
-        void SyncRadios()
-        {
-            _syncing = true;
-            try
-            {
-                foreach ((IconStyle style, RadioButton button) in buttons)
-                    button.Checked = Settings.Style == style;
-            }
-            finally { _syncing = false; }
-        }
-
-        foreach ((IconStyle style, string label, string note) in choices)
-        {
-            IconStyle captured = style;
-            int top = y;
-
-            // 低・中・高の 3 つを並べる。負荷で見た目が変わることを言葉より早く伝えられる。
-            var strip = new Panel
-            {
-                Bounds = new Rectangle(Gutter, top, Swatch * 3 + 16, Swatch),
-                BackColor = Card
-            };
-            strip.Paint += (_, e) =>
-            {
-                Color color = _metrics[0].DefaultColor;
-                double[] samples = { 0.15, 0.55, 0.95 };
-                string[] texts = { "15", "55", "95" };
-                for (int i = 0; i < 3; i++)
-                {
-                    var box = new Rectangle(4 + i * (Swatch + 4), 0, Swatch, Swatch);
-                    DrawPreview(e.Graphics, box, samples[i], texts[i], color, captured);
-                }
-            };
-            _body.Controls.Add(strip);
-            _previews.Add(strip);
-
-            var radio = new RadioButton
-            {
-                Text = label,
-                Checked = Settings.Style == captured,
-                ForeColor = Color.White,
-                AutoSize = false,
-                Bounds = new Rectangle(strip.Right + 12, top + 1, 200, 20)
-            };
-            radio.CheckedChanged += (_, _) =>
-            {
-                if (_syncing || !radio.Checked) return;
-
-                // 画像がまだ無いのに「好きな画像」を選ばれたら、先に画像を作ってもらう。
-                // 途中でやめられたら、選択を元の見た目に戻す。
-                if (captured == IconStyle.Image && _skin() is null)
-                {
-                    _chooseImage();
-                    if (_skin() is null)
-                    {
-                        SyncRadios();
-                        return;
-                    }
-                }
-
-                Settings.Style = captured;
-                _apply();
-                RefreshPreviews();
-            };
-            _body.Controls.Add(radio);
-            buttons.Add((captured, radio));
-
-            _body.Controls.Add(new Label
-            {
-                Text = note,
-                ForeColor = Faint,
-                AutoSize = false,
-                Bounds = new Rectangle(strip.Right + 12, top + 19, 220, 18)
-            });
-
-            y += Swatch + 10;
-        }
-
-        var change = new Button
-        {
-            Text = "画像を選び直す…",
-            FlatStyle = FlatStyle.System,
-            Bounds = new Rectangle(Gutter, y, 150, 28)
-        };
-        change.Click += (_, _) => { _chooseImage(); RefreshPreviews(); };
-        _body.Controls.Add(change);
-
-        return y + 40;
-    }
-
-    // ----- ③ タスクバーに出す ---------------------------------------------
-
-    private int BuildTaskbarSection(int y)
-    {
-        y = SectionTitle(y, "③ タスクバーに出す");
-
-        _body.Controls.Add(new Label
-        {
-            Text = "Windows 11 は新しいアイコンを、最初は「∧」ボタンの中に隠します。\n" +
-                   "下のボタンで表に出せます。",
-            ForeColor = Faint,
-            AutoSize = false,
-            Size = new Size(470, 36),
-            Location = new Point(Gutter, y)
-        });
-        y += 40;
-
-        var button = new Button
-        {
-            Text = "タスクバーに出す",
-            FlatStyle = FlatStyle.System,
-            Bounds = new Rectangle(Gutter, y, 150, 30),
-            Enabled = TrayPromotion.Supported
-        };
-
-        var result = new Label
-        {
-            Text = TrayPromotion.Supported
-                ? ""
-                : "この Windows では手動で出してください（下の説明）。",
-            ForeColor = Faint,
-            AutoSize = false,
-            Bounds = new Rectangle(Gutter + 162, y + 6, 260, 20)
-        };
-
-        button.Click += (_, _) =>
-        {
-            // 希望を覚えておく。Windows 側の設定は消えることがあるので毎回掛け直す。
-            Settings.PromoteTray = true;
-            bool ok = TrayPromotion.Promote();
-            _apply();
-            result.ForeColor = ok ? Color.FromArgb(130, 230, 160) : Color.FromArgb(255, 190, 120);
-            // 失敗しても常駐側が数十秒は試し続けるので、言い切らずに待ってもらう
-            result.Text = ok ? "出しました。" : "少し待ってください。変わらなければ下の手順で。";
-        };
-        _body.Controls.Add(button);
-        _body.Controls.Add(result);
-        y += 36;
-
-        _body.Controls.Add(new Label
-        {
-            Text = "うまくいかないときは、タスクバー右下の「∧」を押して、\n" +
-                   "出てきたアイコンをタスクバーへドラッグしてください。",
-            ForeColor = Faint,
-            AutoSize = false,
-            Size = new Size(470, 36),
-            Location = new Point(Gutter, y)
-        });
-        return y + 44;
-    }
-
-    // ----- 下段 -----------------------------------------------------------
-
-    private int BuildOptions(int y)
-    {
-        y = SectionTitle(y, "④ 見失わないために");
-
-        // 終了するとタスクバーから消える。exe の場所を覚えていない人は戻せなくなるので、
-        // スタートメニューから探せるようにしておく。初回は既定でオンにしている。
-        var startMenu = new CheckBox
-        {
-            Text = "スタートメニューに追加する（終了しても探し出せます）",
-            Checked = StartMenuShortcut.Exists,
-            ForeColor = Color.White,
-            AutoSize = false,
-            Bounds = new Rectangle(Gutter, y, 440, 24)
-        };
-        startMenu.CheckedChanged += (_, _) =>
-        {
-            if (_syncing) return;
-
-            if (!startMenu.Checked) { StartMenuShortcut.Remove(); return; }
-            if (StartMenuShortcut.Create()) return;
-
-            _syncing = true;
-            startMenu.Checked = false;
-            _syncing = false;
-            MessageBox.Show(this,
-                "スタートメニューに追加できませんでした。\n" +
-                "exe の場所をメモしておくか、右クリックで「送る」→「デスクトップ」を使ってください。",
-                "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        };
-        _body.Controls.Add(startMenu);
-        y += 28;
-
-        var autoStart = new CheckBox
-        {
-            Text = "Windows を起動したら自動で始める",
-            Checked = AutoStart.IsEnabled,
-            ForeColor = Color.White,
-            AutoSize = false,
-            Bounds = new Rectangle(Gutter, y, 440, 24)
-        };
-        autoStart.CheckedChanged += (_, _) =>
-        {
-            if (_syncing) return;
-            AutoStart.Set(autoStart.Checked);
-        };
-        _body.Controls.Add(autoStart);
-
-        return y + 30;
-    }
-
-    /// <summary>本文の下に固定する帯。スクロールしてもボタンが隠れないようにする。</summary>
-    private Control BuildButtonBar(bool firstRun, int width, int top, int height)
-    {
-        var bar = new Panel
-        {
-            Bounds = new Rectangle(0, top, width, height),
-            BackColor = Card
-        };
-        // 本文との境目。スクロールしたときに帯が浮いて見えるように 1 本引く
-        bar.Paint += (_, e) =>
-        {
-            using var line = new Pen(Color.FromArgb(70, 70, 80));
-            e.Graphics.DrawLine(line, 0, 0, width, 0);
-        };
-
-        var close = new Button
-        {
-            Text = firstRun ? "使いはじめる" : "閉じる",
-            DialogResult = DialogResult.OK,
-            FlatStyle = FlatStyle.System,
-            Bounds = new Rectangle(width - Gutter - 130, (height - 32) / 2, 130, 32)
-        };
-        bar.Controls.Add(close);
-        AcceptButton = close;
-        CancelButton = close;
-
-        return bar;
     }
 
     // ----- プレビュー -----------------------------------------------------
