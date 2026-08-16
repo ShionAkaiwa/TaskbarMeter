@@ -2360,7 +2360,11 @@ internal sealed class SetupForm : Form
                                 new Rectangle(pad + i * (side + pad), top, side, side),
                                 samples[i], texts[i], color, captured);
             };
+            // 説明文は次の行に置き、ラジオは全部この grid の直接の子にする。
+            // **入れ子のパネルに 1 つずつ入れてはいけない。** ラジオの「どれか 1 つ」は
+            // 同じ親の中でしか働かないので、別々の親に入れると 2 つ選べてしまう。
             grid.Controls.Add(strip, 0, rowIndex);
+            grid.SetRowSpan(strip, 2);
             _previews.Add(strip);
 
             var radio = new RadioButton
@@ -2369,14 +2373,21 @@ internal sealed class SetupForm : Form
                 Checked = Settings.Style == captured,
                 ForeColor = Color.White,
                 AutoSize = true,
+                Anchor = AnchorStyles.Left | AnchorStyles.Bottom,
                 Margin = new Padding(0)
             };
             radio.CheckedChanged += (_, _) => OnStyleChosen(radio, captured);
             _styleButtons.Add((captured, radio));
+            grid.Controls.Add(radio, 1, rowIndex);
 
-            grid.Controls.Add(Stack(radio, Para(note, Faint)), 1, rowIndex);
+            Label note2 = Para(note, Faint);
+            note2.Anchor = AnchorStyles.Left | AnchorStyles.Top;
+            note2.Margin = new Padding(0, 0, 0, Unit / 3);
+            grid.Controls.Add(note2, 1, rowIndex + 1);
+
             grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            rowIndex++;
+            grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            rowIndex += 2;
         }
 
         var change = new Button
