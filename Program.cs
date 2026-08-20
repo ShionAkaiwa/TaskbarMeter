@@ -1175,28 +1175,128 @@ internal static class IconFactory
     private static readonly Color HotTone = Color.FromArgb(255, 96, 72);
 
     /// <summary>
-    /// ドット絵キャラの下地。
+    /// 段階ごとの下地。負荷が上がるほど背が伸びて、頭の毛が立つ。
+    /// 16px では細かい表情よりも輪郭のほうが先に目に入るので、
+    /// 「いまどの段階か」をまず形で分かるようにしてある。
     /// L=上のハイライト / C=本体色 / c=下の陰 / #=輪郭 / .=透明。
     /// 上を明るく下を暗くしておくと、16px でも平たい丸ではなく球体に見える。
     /// </summary>
-    private static readonly string[] BaseSprite =
+    private static readonly string[][] StageSprites =
     {
-        ".....######.....",
-        "...##LLLLLL##...",
-        "..#LLLLLLLLLL#..",
-        ".#LLLLLLLLLLLL#.",
-        ".#CCCCCCCCCCCC#.",
-        "#CCCCCCCCCCCCCC#",
-        "#CCCCCCCCCCCCCC#",
-        "#CCCCCCCCCCCCCC#",
-        "#CCCCCCCCCCCCCC#",
-        ".#CCCCCCCCCCCC#.",
-        ".#cccccccccccc#.",
-        "..#cccccccccc#..",
-        "...##cccccc##...",
-        ".....######.....",
-        "................",
-        "................"
+        // うとうと: いちばん低い。毛も寝ている
+        new[]
+        {
+            "................",
+            "................",
+            "................",
+            "................",
+            "................",
+            "......CC........",
+            "....########....",
+            "..##LLLLLLLL##..",
+            ".#LLLLLLLLLLLL#.",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            ".#cccccccccccc#.",
+            "..##cccccccc##..",
+            "....########....",
+            "................",
+            "................"
+        },
+        // ふつう: 起きて、毛が少し立つ
+        new[]
+        {
+            "................",
+            "................",
+            "........C.......",
+            "........C.......",
+            ".....######.....",
+            "...##LLLLLL##...",
+            "..#LLLLLLLLLL#..",
+            ".#CCCCCCCCCCCC#.",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            ".#CCCCCCCCCCCC#.",
+            ".#cccccccccccc#.",
+            "..##cccccccc##..",
+            "....########....",
+            "................",
+            "................"
+        },
+        // ごきげん: 背が伸びて、毛が跳ねる
+        new[]
+        {
+            "................",
+            ".........C......",
+            "........CC......",
+            ".....######.....",
+            "...##LLLLLL##...",
+            "..#LLLLLLLLLL#..",
+            ".#CCCCCCCCCCCC#.",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            ".#CCCCCCCCCCCC#.",
+            ".#cccccccccccc#.",
+            "..##cccccccc##..",
+            "....########....",
+            "................",
+            "................"
+        },
+        // あせり: さらに伸びて、毛がぴんと立つ
+        new[]
+        {
+            "........C.......",
+            "........C.......",
+            ".....######.....",
+            "...##LLLLLL##...",
+            "..#LLLLLLLLLL#..",
+            ".#LLLLLLLLLLLL#.",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            ".#CCCCCCCCCCCC#.",
+            ".#cccccccccccc#.",
+            "..##cccccccc##..",
+            "....########....",
+            "................",
+            "................"
+        },
+        // 限界: 体がいちばん大きく、毛も残っていない
+        new[]
+        {
+            "................",
+            ".....######.....",
+            "...##LLLLLL##...",
+            "..#LLLLLLLLLL#..",
+            ".#LLLLLLLLLLLL#.",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            "#CCCCCCCCCCCCCC#",
+            ".#CCCCCCCCCCCC#.",
+            ".#cccccccccccc#.",
+            "..##cccccccc##..",
+            "....########....",
+            "................",
+            "................"
+        }
+    };
+
+    /// <summary>
+    /// 段階ごとの顔の位置。体の高さが段階で変わるので、目・ほっぺ・口の行も一緒に動かす。
+    /// Eye は楕円の目の上端で、閉じ目・笑い目・× 目もここを基準に置く。
+    /// Cheek はほっぺの行（あせり以上は付けないので使わない）。Mouth は口の上端。
+    /// </summary>
+    private static readonly (int Eye, int Cheek, int Mouth)[] FaceRows =
+    {
+        (8, 11, 11),   // うとうと
+        (6, 10, 11),   // ふつう
+        (6, 10, 11),   // ごきげん
+        (5,  0, 10),   // あせり
+        (5,  0,  9)    // 限界
     };
 
     /// <summary>
@@ -1264,9 +1364,10 @@ internal static class IconFactory
         {
             IconStyle.Face => Render(BuildFace(percent, mood), tone),
             IconStyle.Image when skin is not null
-                => CreateFromSkin(percent, tone, skin, smoothSkin, mood.Recording),
+                => CreateFromSkin(percent, tone, skin, smoothSkin,
+                                  mood.Recording && RecordingDotOn(mood.Tick)),
             IconStyle.Image => Render(BuildFace(percent, mood), tone),
-            _ => Render(BuildNumber(percent, text, mood.Recording), tone)
+            _ => Render(BuildNumber(percent, text, mood.Recording && RecordingDotOn(mood.Tick)), tone)
         };
     }
 
@@ -1323,6 +1424,13 @@ internal static class IconFactory
 
     private static Color Hot(Color tone) => Blend(tone, HotTone, 0.85);
 
+    /// <summary>
+    /// 計測中の赤ドットを出すか。2 秒点いて 1 秒消える。
+    /// 出しっぱなしだと「録れているのか」が分かりにくいが、1 秒ごとに
+    /// 明滅させるとちらついて見えるので、3 秒周期にしてある。
+    /// </summary>
+    private static bool RecordingDotOn(int tick) => tick % 3 != 2;
+
     /// <summary>計測中の目印（左上の赤いドット）。</summary>
     private static void PaintRecordingDot(char[][] grid)
     {
@@ -1339,10 +1447,14 @@ internal static class IconFactory
     /// </summary>
     private static char[][] BuildFace(int percent, IconMood mood)
     {
-        char[][] grid = BaseSprite.Select(row => row.ToCharArray()).ToArray();
-
         int stage = Stage(percent);
-        bool blink = mood.Tick % 9 == 0;
+        char[][] grid = StageSprites[stage].Select(row => row.ToCharArray()).ToArray();
+        (int eye, int cheek, int mouth) = FaceRows[stage];
+
+        int t = mood.Tick;
+        // まばたき。9 秒に 1 回、そのうち 45 秒に 1 回は 2 度続けて閉じる。
+        // きっちり等間隔だと機械に見えるので、たまに崩している。
+        bool blink = t % 9 == 0 || t % 45 == 2;
         bool closedEyes = stage == 0 || (blink && stage is 1 or 2);
 
         void Set(int y, int x, char c)
@@ -1363,92 +1475,95 @@ internal static class IconFactory
             Set(top + 3, left + 1, 'K');
         }
 
-        // ----- 目（左目 x=3..5 / 右目 x=10..12、高さ y=5..8） -----
+        // ----- 目（左目 x=3..5 / 右目 x=10..12） -----
         if (stage == 4)
         {
             // × 目
-            Pair(5, 3, 'K'); Pair(5, 5, 'K');
-            Pair(6, 4, 'K');
-            Pair(7, 3, 'K'); Pair(7, 5, 'K');
+            Pair(eye, 3, 'K'); Pair(eye, 5, 'K');
+            Pair(eye + 1, 4, 'K');
+            Pair(eye + 2, 3, 'K'); Pair(eye + 2, 5, 'K');
         }
         else if (closedEyes)
         {
             // 閉じ目。両端を上げた弧にすると、ただの横線より気持ちよさそうに見える。
-            Pair(6, 3, 'K'); Pair(6, 5, 'K');
-            Pair(7, 4, 'K');
+            Pair(eye + 1, 3, 'K'); Pair(eye + 1, 5, 'K');
+            Pair(eye + 2, 4, 'K');
         }
         else if (stage == 2)
         {
             // ^ ^ の笑い目
-            Pair(6, 4, 'K');
-            Pair(7, 3, 'K'); Pair(7, 4, 'K'); Pair(7, 5, 'K');
+            Pair(eye + 1, 4, 'K');
+            Pair(eye + 2, 3, 'K'); Pair(eye + 2, 4, 'K'); Pair(eye + 2, 5, 'K');
         }
         else
         {
-            OvalEye(3, 5);
-            OvalEye(10, 5);
+            OvalEye(3, eye);
+            OvalEye(10, eye);
 
-            if (stage == 3) Pair(6, 4, 'W');   // 瞳だけ小さく残して「見開き」
-            else Pair(6, 3, 'W');              // つやのハイライト
+            if (stage == 3) Pair(eye + 1, 4, 'W');   // 瞳だけ小さく残して「見開き」
+            else Pair(eye + 1, 3, 'W');              // つやのハイライト
         }
 
         // ----- ほっぺ -----
         if (stage <= 2)
         {
-            Pair(9, 2, 'P'); Pair(9, 3, 'P');
-            if (stage == 2) { Pair(8, 2, 'P'); Pair(8, 3, 'P'); }   // ごきげんは濃いめ
+            Pair(cheek, 2, 'P'); Pair(cheek, 3, 'P');
+            if (stage == 2) { Pair(cheek - 1, 2, 'P'); Pair(cheek - 1, 3, 'P'); }   // ごきげんは濃いめ
         }
 
         // ----- 口 -----
         switch (stage)
         {
             case 0:
-                Pair(11, 7, 'K');                                   // ちいさい口
+                Pair(mouth, 7, 'K');                                        // ちいさい口
                 break;
             case 1:
-                Pair(11, 6, 'K'); Pair(11, 7, 'K');                 // 一文字
+                Pair(mouth, 6, 'K'); Pair(mouth, 7, 'K');                   // 一文字
                 break;
             case 2:
-                Pair(10, 6, 'K'); Pair(10, 7, 'K');                 // 開いたにこにこ
-                Pair(11, 7, 'K');
+                Pair(mouth, 6, 'K'); Pair(mouth, 7, 'K');                   // 開いたにこにこ
+                Pair(mouth + 1, 7, 'K');
                 break;
             case 3:
-                Pair(10, 5, 'K'); Pair(10, 7, 'K');                 // ぎざぎざ
-                Pair(11, 6, 'K');
+                Pair(mouth, 5, 'K'); Pair(mouth, 7, 'K');                   // ぎざぎざ
+                Pair(mouth + 1, 6, 'K');
                 break;
             default:
                 // 大きく開いた口。四隅まで塗ると黒が重すぎて、口ではなく
                 // 体に穴が空いたように見える（目を楕円にしたのと同じ理由）。
-                // 下端(y=12)まで下ろすと輪郭と地続きになって「割れている」ように
-                // 見えるので、1 行上げて体の中に浮かせる。
-                Pair(9, 6, 'K'); Pair(9, 7, 'K');
-                Pair(10, 5, 'K'); Pair(10, 6, 'K'); Pair(10, 7, 'K');
-                Pair(11, 6, 'K'); Pair(11, 7, 'K');
+                Pair(mouth, 6, 'K'); Pair(mouth, 7, 'K');
+                Pair(mouth + 1, 5, 'K'); Pair(mouth + 1, 6, 'K'); Pair(mouth + 1, 7, 'K');
+                Pair(mouth + 2, 6, 'K'); Pair(mouth + 2, 7, 'K');
                 break;
         }
 
         // ----- 付属物 -----
         if (stage == 0)
         {
-            // zzz。白のままだとライトテーマのタスクバー（ほぼ白）に溶けて消えるため、
-            // 汗と同じ水色にしてある。明暗どちらの地の色でも残る。
-            Set(0, 13, 'B'); Set(0, 14, 'B'); Set(0, 15, 'B');
-            Set(1, 14, 'B');
-            Set(2, 13, 'B'); Set(2, 14, 'B'); Set(2, 15, 'B');
+            // zzz。3x3 では z と 工 の区別が付かないので、対角がはっきり出る 4x4 で描く。
+            // この段階は体が低いぶん上に余白があるので、そこを使える。
+            // 3 秒ごとに 1 ドットだけ浮き上がる。体を動かすと 1 秒タイマーでは
+            // ちらついて見えるが、マークがゆっくり漂うぶんには落ち着いて見える。
+            int zy = 1 - (t / 3) % 2;
+            Set(zy, 11, 'B'); Set(zy, 12, 'B'); Set(zy, 13, 'B'); Set(zy, 14, 'B');
+            Set(zy + 1, 13, 'B');
+            Set(zy + 2, 12, 'B');
+            Set(zy + 3, 11, 'B'); Set(zy + 3, 12, 'B');
+            Set(zy + 3, 13, 'B'); Set(zy + 3, 14, 'B');
         }
         else if (stage >= 3)
         {
             // 汗。限界のときは反対側にもう 1 粒足す。
             // 体の輪郭('#')に重ねると丸いシルエットが欠けて見えるので、外側だけに置く。
             // 上 2 マス（y=0,1）は計測中の赤ドットが載る場所なので空けておく。
-            Set(2, 0, 'B'); Set(2, 1, 'B'); Set(3, 0, 'B'); Set(4, 0, 'B');
+            Set(2, 1, 'B'); Set(3, 0, 'B'); Set(3, 1, 'B'); Set(4, 0, 'B');
             if (stage == 4)
             {
-                Set(2, 14, 'B'); Set(2, 15, 'B'); Set(3, 15, 'B'); Set(4, 15, 'B');
+                Set(2, 14, 'B'); Set(3, 14, 'B'); Set(3, 15, 'B'); Set(4, 15, 'B');
             }
         }
 
-        if (mood.Recording) PaintRecordingDot(grid);
+        if (mood.Recording && RecordingDotOn(t)) PaintRecordingDot(grid);
         PaintGauge(grid, percent);
         return grid;
     }
