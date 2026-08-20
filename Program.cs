@@ -56,7 +56,16 @@ internal readonly record struct Sample(
 /// </summary>
 /// <param name="Tick">起動からの秒数。まばたきの位相に使う。</param>
 /// <param name="Recording">計測中か。</param>
-internal readonly record struct IconMood(int Tick = 0, bool Recording = false);
+/// <param name="Stage">
+/// 使う段階（0〜4）。負の値なら使用率から決める。
+/// 段階が変わると体の形ごと変わるので、しきい値をまたいで往復する負荷で
+/// 毎秒跳ねないよう、常駐側でヒステリシスを掛けた結果をここで渡す。
+/// </param>
+/// <param name="Phase">
+/// まばたきの位相ずらし。指標ごとに変えて、並んだアイコンが一斉に目を閉じないようにする。
+/// </param>
+internal readonly record struct IconMood(int Tick = 0, bool Recording = false,
+                                         int Stage = -1, int Phase = 0);
 
 // ---------------------------------------------------------------------------
 //  本体
@@ -75,6 +84,20 @@ internal sealed class MeterContext : ApplicationContext
 
         /// <summary>ユーザーが表示 ON にしているか。OFF のあいだは読み取りもしない。</summary>
         public bool Enabled { get; set; }
+
+        /// <summary>
+        /// いま描いている段階（0〜4）。しきい値をまたいで往復する負荷で
+        /// 体の形が毎秒変わらないよう、前回の段階を覚えて引っぱる。-1 は未決定。
+        /// </summary>
+        public int Stage { get; set; } = -1;
+
+        /// <summary>まばたきの位相ずらし。アイコンが一斉に目を閉じないようにするため。</summary>
+        public int Phase { get; init; }
+
+        /// <summary>
+        /// 描くのに使う色。毎秒レジストリを読みに行かないよう、設定が変わったときだけ更新する。
+        /// </summary>
+        public Color Color { get; set; }
     }
 
     private readonly List<Metric> _metrics = MetricCatalog.CreateAll();
@@ -127,6 +150,9 @@ internal sealed class MeterContext : ApplicationContext
     private int _hintCountdown;
     private int _tick;
 
+    /// <summary>出せるようになるまで持ち越す知らせ。起動直後はアイコンがまだ出ていない。</summary>
+    private string? _pendingNotice;
+
     public MeterContext(EventWaitHandle showRequest)
     {
         _showRequest = showRequest;
@@ -172,6 +198,12 @@ internal sealed class MeterContext : ApplicationContext
         };
 
         _pendingSetup = !Settings.SetupDone;
+
+        // Windows 側の「タスクバーに出す」の記録は、exe を動かしたり explorer が
+        // 作り直したりすると消える。希望が保存されているなら起動のたびに掛け直す。
+        // 設定にはそう書いてあったが、実際には設定画面を開いたときしか掛かっていなかった。
+        if (Settings.PromoteTray) _promoteTries = PromoteRetrySeconds;
+
         _timer.Start();
 
         // 初回はここで計測を始めない。カウンタの組み立てに時間がかかり、
@@ -182,8 +214,11 @@ internal sealed class MeterContext : ApplicationContext
         {
             _autoItem.Enabled = false;
             if (_mode == DisplayMode.Auto) SetMode(DisplayMode.Always);
-            Notify("Ctrl+Alt+M が他のアプリと競合しており登録できませんでした。" +
-                   "「高負荷のときだけ表示」は無効にしています。", ToolTipIcon.Warning);
+
+            // ここで直接出しても届かない。アイコンにまだ絵が入っておらず、
+            // シェルに登録されていないのでバルーンは捨てられる。出せるまで持ち越す。
+            _pendingNotice = "Ctrl+Alt+M が他のアプリと競合しており登録できませんでした。" +
+                             "「高負荷のときだけ表示」は無効にしています。";
         }
     }
 
@@ -298,8 +333,7 @@ internal sealed class MeterContext : ApplicationContext
                     return;
                 }
                 Settings.SetMetricEnabled(captured.Id, item.Checked);
-                SyncSlots();
-                Update();
+                Reapply();
             };
             _syncMenu += () => item.Checked =
                 Settings.MetricEnabled(captured.Id, captured.DefaultEnabled);
@@ -326,7 +360,7 @@ internal sealed class MeterContext : ApplicationContext
                 if (dialog.ShowDialog() == DialogResult.OK)
                 {
                     Settings.SetMetricColor(captured.Id, dialog.Color);
-                    Update();
+                    Reapply();
                 }
             };
             root.DropDownItems.Add(item);
@@ -337,7 +371,7 @@ internal sealed class MeterContext : ApplicationContext
         reset.Click += (_, _) =>
         {
             foreach (Metric metric in _metrics) Settings.ClearMetricColor(metric.Id);
-            Update();
+            Reapply();
         };
         root.DropDownItems.Add(reset);
         return root;
@@ -369,7 +403,7 @@ internal sealed class MeterContext : ApplicationContext
             _style = style;
             Settings.Style = style;
             RefreshChecks();
-            Update();
+            Reapply();
         }
 
         number.Click += (_, _) => Apply(IconStyle.Number);
@@ -411,6 +445,13 @@ internal sealed class MeterContext : ApplicationContext
         }
 
         Settings.SetupDone = true;
+
+        // exe をもう一度起動して「出てきて」を使ったときの強制表示を、ここで下ろす。
+        // 下ろさないと「高負荷のときだけ表示」を選んでいても出っぱなしになり、
+        // 設定が効いていないように見える。しばらくは _cooldown が出したままにしてくれる。
+        _forceShow = false;
+        _cooldown = CooldownSeconds;
+
         ReloadFromSettings();
     }
 
@@ -427,14 +468,13 @@ internal sealed class MeterContext : ApplicationContext
         // ここでも試行回数を積み直しておく
         if (Settings.PromoteTray) _promoteTries = Math.Max(_promoteTries, PromoteRetrySeconds);
 
-        SyncSlots();
         RefreshModeChecks();
 
         _syncingMenu = true;
         try { _syncMenu(); }
         finally { _syncingMenu = false; }
 
-        Update();
+        Reapply();
     }
 
     /// <summary>画像を選び、ドット絵に変換してプレビューし、採用されたら保存する。</summary>
@@ -443,7 +483,9 @@ internal sealed class MeterContext : ApplicationContext
         using var dialog = new OpenFileDialog
         {
             Title = "ドット絵にする画像を選ぶ",
-            Filter = "画像ファイル|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|すべてのファイル|*.*"
+            // webp は載せないこと。GDI+ にデコーダが無く、選ばせておいて
+            // 「パラメーターが正しくありません」で落ちる
+            Filter = "画像ファイル|*.png;*.jpg;*.jpeg;*.bmp;*.gif|すべてのファイル|*.*"
         };
         if (dialog.ShowDialog() != DialogResult.OK) return;
 
@@ -458,7 +500,7 @@ internal sealed class MeterContext : ApplicationContext
             _skin = preview.Result;
             _style = IconStyle.Image;
             Settings.Style = IconStyle.Image;
-            Update();
+            Reapply();
         }
         catch (Exception ex)
         {
@@ -489,7 +531,8 @@ internal sealed class MeterContext : ApplicationContext
                 ContextMenuStrip = _menu,
                 Text = metric.Name
             };
-            _slots[metric.Id] = new Slot { Metric = metric, Notify = notify };
+            // 位相は指標ごとに固定でずらす。全部が同じ秒に目を閉じると機械に見える。
+            _slots[metric.Id] = new Slot { Metric = metric, Notify = notify, Phase = _slots.Count * 3 };
         }
         SyncSlots();
     }
@@ -500,6 +543,7 @@ internal sealed class MeterContext : ApplicationContext
         foreach (Slot slot in _slots.Values)
         {
             slot.Enabled = Settings.MetricEnabled(slot.Metric.Id, slot.Metric.DefaultEnabled);
+            slot.Color = Settings.MetricColor(slot.Metric.Id, slot.Metric.DefaultColor);
             slot.Notify.Visible = slot.Enabled && _iconsVisible;
         }
     }
@@ -510,10 +554,25 @@ internal sealed class MeterContext : ApplicationContext
 
     // ----- 毎秒の更新 -----------------------------------------------------
 
+    /// <summary>
+    /// 1 秒ごとの本体。指標を読み、記録し、アイコンを描き直す。
+    ///
+    /// **タイマーからだけ呼ぶこと。** 設定を変えた直後の反映は Apply() を使う。
+    /// 指標の多くは「前回読んだときからの差」で値を出しているので、短い間隔で
+    /// 呼ぶと差が取れずに 0% になる。メニューを触っている間ずっと CPU が 0% に
+    /// 見えていたのはこれが原因だった。まばたきの位相もここで進む。
+    /// </summary>
     private void Update()
     {
+        // 記録中は、表示を切った指標も読み続ける。読まないと記録に 0 が並び、
+        // グラフと平均・最小が実際より低く出る。
+        List<Slot> reading = _slots.Values
+            .Where(slot => slot.Enabled ||
+                           (_recorder.Recording && _recorder.Tracks(slot.Metric.Id)))
+            .ToList();
+
         if (_tick++ % 5 == 0)
-            foreach (Slot slot in ActiveSlots) slot.Metric.Refresh();
+            foreach (Slot slot in reading) slot.Metric.Refresh();
 
         // exe をもう一度起動した場合の「出てきて」要求。
         // わざわざ起動し直したということは見失っている可能性が高いので、
@@ -526,13 +585,18 @@ internal sealed class MeterContext : ApplicationContext
         }
 
         var samples = new Dictionary<string, Sample>();
+        foreach (Slot slot in reading)
+        {
+            // 1 つの指標が投げても、他の指標とアプリ自体は生かす。
+            // ここで落ちるとタイマーごと止まり、右クリックする先も無くなる。
+            try { samples[slot.Metric.Id] = slot.Metric.Read(); }
+            catch { samples[slot.Metric.Id] = new Sample(0, "--", $"{slot.Metric.Name} 取得不可"); }
+        }
+
         double peak = 0;
         foreach (Slot slot in ActiveSlots)
-        {
-            Sample sample = slot.Metric.Read();
-            samples[slot.Metric.Id] = sample;
-            peak = Math.Max(peak, sample.Ratio);
-        }
+            if (samples.TryGetValue(slot.Metric.Id, out Sample shown))
+                peak = Math.Max(peak, shown.Ratio);
 
         _lastSamples = samples;
         WatchVramPressure(samples);
@@ -545,26 +609,58 @@ internal sealed class MeterContext : ApplicationContext
         if (peak * 100 >= _threshold) _cooldown = CooldownSeconds;
         else if (_cooldown > 0) _cooldown--;
 
-        bool shouldShow = _forceShow
-                          || (!_forceHide && (_mode == DisplayMode.Always || _cooldown > 0));
-        SetVisible(shouldShow);
+        SetVisible(ShouldShow);
+        Redraw();
+
+        if (_pendingNotice is not null && Notify(_pendingNotice, ToolTipIcon.Warning))
+            _pendingNotice = null;
+    }
+
+    private bool ShouldShow => _forceShow
+                               || (!_forceHide && (_mode == DisplayMode.Always || _cooldown > 0));
+
+    /// <summary>
+    /// 設定を読み直して、いまの値のままアイコンを出し直す。
+    /// メニューや設定画面を操作した直後の反映はこちら。
+    /// </summary>
+    private void Reapply()
+    {
+        SyncSlots();
+        SetVisible(ShouldShow);
+        Redraw();
+    }
+
+    /// <summary>直前に読んだ値でアイコンを描き直す。指標は読み直さない。</summary>
+    private void Redraw()
+    {
         if (!_iconsVisible) return;
 
-        var mood = new IconMood(_tick, _recorder.Recording);
         foreach (Slot slot in ActiveSlots)
         {
-            Sample sample = samples[slot.Metric.Id];
-            Color color = Settings.MetricColor(slot.Metric.Id, slot.Metric.DefaultColor);
-
-            IconStyle style = _style == IconStyle.Image && _skin is null ? IconStyle.Face : _style;
-            Icon fresh = IconFactory.Create(sample.Ratio, sample.Text, color, style,
-                                            mood, _skin, _skinSmooth);
-            slot.Notify.Icon = fresh;
-            slot.Current?.Dispose();
-            slot.Current = fresh;
-
-            slot.Notify.Text = sample.Tooltip;
+            if (!_lastSamples.TryGetValue(slot.Metric.Id, out Sample sample)) continue;
+            try { DrawSlot(slot, sample); }
+            catch { /* 1 つ描けなくても残りは描く。常駐が止まらないことを優先する */ }
         }
+    }
+
+    private void DrawSlot(Slot slot, Sample sample)
+    {
+        int percent = (int)Math.Round(Math.Clamp(sample.Ratio, 0, 1) * 100);
+
+        // 段階は前回の値から引っぱって決める。境目に張り付いた負荷で
+        // 体の形が毎秒変わると、震えているように見えてしまう。
+        slot.Stage = IconFactory.NextStage(slot.Stage, percent);
+
+        IconStyle style = _style == IconStyle.Image && _skin is null ? IconStyle.Face : _style;
+        var mood = new IconMood(_tick, _recorder.Recording, slot.Stage, slot.Phase);
+
+        Icon fresh = IconFactory.Create(sample.Ratio, sample.Text, slot.Color, style,
+                                        mood, _skin, _skinSmooth);
+        slot.Notify.Icon = fresh;
+        slot.Current?.Dispose();
+        slot.Current = fresh;
+
+        slot.Notify.Text = sample.Tooltip;
     }
 
     // ----- 計測セッション -------------------------------------------------
@@ -625,10 +721,11 @@ internal sealed class MeterContext : ApplicationContext
             _vramHighSeconds++;
             if (_vramHighSeconds >= 5 && !_vramNotified)
             {
-                _vramNotified = true;
-                Notify($"VRAM が {(int)Math.Round(vram.Ratio * 100)}% です。" +
-                       "このまま増えると学習が落ちるかもしれません。",
-                       ToolTipIcon.Warning, "VRAM がいっぱいです");
+                // 出せなかったら知らせたことにしない。次の tick でまた試す。
+                _vramNotified = Notify(
+                    $"VRAM が {(int)Math.Round(vram.Ratio * 100)}% です。" +
+                    "このまま増えると学習が落ちるかもしれません。",
+                    ToolTipIcon.Warning, "VRAM がいっぱいです");
             }
             return;
         }
@@ -666,9 +763,9 @@ internal sealed class MeterContext : ApplicationContext
         _gpuIdleSeconds++;
         if (_gpuIdleSeconds >= 180 && !_finishNotified)
         {
-            _finishNotified = true;
-            Notify("GPU が 3 分間ほとんど動いていません。処理が終わったかもしれません。",
-                   ToolTipIcon.Info, "TaskbarMeter");
+            _finishNotified = Notify(
+                "GPU が 3 分間ほとんど動いていません。処理が終わったかもしれません。",
+                ToolTipIcon.Info, "TaskbarMeter");
         }
     }
 
@@ -682,7 +779,7 @@ internal sealed class MeterContext : ApplicationContext
         _forceHide = false;
         _cooldown = CooldownSeconds;
         RefreshModeChecks();
-        Update();
+        Reapply();
     }
 
     private void RefreshModeChecks()
@@ -708,7 +805,7 @@ internal sealed class MeterContext : ApplicationContext
             _forceHide = false;
             _cooldown = CooldownSeconds;
         }
-        Update();
+        Reapply();
     }
 
     private void SetVisible(bool visible)
@@ -734,10 +831,21 @@ internal sealed class MeterContext : ApplicationContext
         foreach (Slot slot in _slots.Values) slot.Notify.Visible = visible && slot.Enabled;
     }
 
-    private void Notify(string message, ToolTipIcon icon, string title = "TaskbarMeter")
+    /// <summary>
+    /// バルーンで知らせる。出せたときだけ true。
+    ///
+    /// アイコンが隠れている（Ctrl+Alt+M、または「高負荷のときだけ表示」で引っ込んでいる）
+    /// あいだ、ShowBalloonTip は何も言わずに捨てられる。呼んだ側が「知らせた」ことに
+    /// してしまうと、VRAM の警告がいちばん気づきたい状況（席を外していてアイコンを
+    /// 隠している）で消える。出せたかどうかを返して、呼んだ側が判断できるようにする。
+    /// </summary>
+    private bool Notify(string message, ToolTipIcon icon, string title = "TaskbarMeter")
     {
-        Slot? first = ActiveSlots.FirstOrDefault();
-        first?.Notify.ShowBalloonTip(5000, title, message, icon);
+        Slot? shown = ActiveSlots.FirstOrDefault(slot => slot.Notify.Visible);
+        if (shown is null) return false;
+
+        shown.Notify.ShowBalloonTip(5000, title, message, icon);
+        return true;
     }
 
     /// <summary>
@@ -916,8 +1024,12 @@ internal sealed class RamMetric : Metric
 /// <summary>パフォーマンスカウンタを合算する指標の共通処理。</summary>
 internal abstract class CounterMetric : Metric
 {
-    private List<PerformanceCounter> _counters = new();
+    /// <summary>読めなくなったあと、掛け直すまでの待ち時間。</summary>
+    private const int RetryDelayMs = 60_000;
+
+    private readonly Dictionary<string, PerformanceCounter> _counters = new();
     private bool _built;
+    private long _retryAt;
 
     protected bool Available { get; private set; } = true;
     protected abstract string CategoryEnglish { get; }
@@ -933,54 +1045,79 @@ internal abstract class CounterMetric : Metric
 
     public override void Refresh()
     {
-        if (!Available) return;
+        // 一度失敗しても諦めきらない。スリープからの復帰直後、ユーザーの切り替え、
+        // GPU ドライバの更新中などはカウンタが一時的に読めなくなる。
+        // 諦めたままだと、再起動するまでその指標が「取得不可」で固まる。
+        if (!Available)
+        {
+            if (Environment.TickCount64 < _retryAt) return;
+            Available = true;
+        }
+
         if (_built && !Volatile) return;
 
         try
         {
             var category = new PerformanceCounterCategory(PerfNames.Localize(CategoryEnglish));
-            string[] instances = category.GetInstanceNames().Where(Match).ToArray();
+            var live = new HashSet<string>(category.GetInstanceNames().Where(Match));
             string counterName = PerfNames.Localize(CounterEnglish);
 
-            var fresh = instances
-                .Select(n => new PerformanceCounter(category.CategoryName, counterName, n, readOnly: true))
-                .ToList();
-
-            foreach (PerformanceCounter counter in fresh)
+            // 生き残っているカウンタは作り直さないこと。
+            // これらは「前回読んだ時点との差」で値を出すので、作り直すと基準が消え、
+            // 直後の NextValue() は差がほぼ 0 の区間を見て 0 を返す。
+            // 全部作り直していたころは、張り替えのたびに GPU が 0% に見えていた
+            // （5 秒ごとに表情が「限界」から「うとうと」に落ちる形で出ていた）。
+            foreach (string gone in _counters.Keys.Where(name => !live.Contains(name)).ToList())
             {
-                try { counter.NextValue(); } catch { /* 消えたインスタンスは無視 */ }
+                _counters[gone].Dispose();
+                _counters.Remove(gone);
             }
 
-            foreach (PerformanceCounter old in _counters) old.Dispose();
-            _counters = fresh;
+            foreach (string name in live)
+            {
+                if (_counters.ContainsKey(name)) continue;
+                var counter = new PerformanceCounter(category.CategoryName, counterName, name,
+                                                     readOnly: true);
+                try { counter.NextValue(); } catch { /* 消えたインスタンスは無視 */ }
+                _counters[name] = counter;
+            }
+
             _built = true;
         }
         catch
         {
             Available = false;
+            _retryAt = Environment.TickCount64 + RetryDelayMs;
         }
     }
 
-    protected double Collect()
+    /// <summary>
+    /// カウンタを合算する。1 つも読めなければ false を返す。
+    /// 「本当に 0%」と「読めなくて 0」を区別しないと、見守り通知が
+    /// 動いている最中に「終わったかも」と言い出す。
+    /// </summary>
+    protected bool TryCollect(out double total)
     {
         if (!_built) Refresh();
 
-        double total = 0;
-        foreach (PerformanceCounter counter in _counters)
+        total = 0;
+        int read = 0;
+        foreach (PerformanceCounter counter in _counters.Values)
         {
             try
             {
                 float value = counter.NextValue();
                 total = UseMax ? Math.Max(total, value) : total + value;
+                read++;
             }
             catch { /* 消えたインスタンスは無視 */ }
         }
-        return total;
+        return read > 0;
     }
 
     public override void Dispose()
     {
-        foreach (PerformanceCounter counter in _counters) counter.Dispose();
+        foreach (PerformanceCounter counter in _counters.Values) counter.Dispose();
         _counters.Clear();
     }
 }
@@ -1001,8 +1138,8 @@ internal sealed class GpuMetric : CounterMetric
 
     public override Sample Read()
     {
-        if (!Available) return new Sample(0, "--", "GPU 3D 取得不可");
-        double ratio = Math.Clamp(Collect() / 100.0, 0, 1);
+        if (!TryCollect(out double used)) return new Sample(0, "--", "GPU 3D 取得不可");
+        double ratio = Math.Clamp(used / 100.0, 0, 1);
         return new Sample(ratio, Percent(ratio), $"GPU 3D {Percent(ratio)}%", ratio * 100, "%");
     }
 }
@@ -1027,8 +1164,8 @@ internal sealed class GpuComputeMetric : CounterMetric
 
     public override Sample Read()
     {
-        if (!Available) return new Sample(0, "--", "GPU Compute 取得不可");
-        double ratio = Math.Clamp(Collect() / 100.0, 0, 1);
+        if (!TryCollect(out double busy)) return new Sample(0, "--", "GPU Compute 取得不可");
+        double ratio = Math.Clamp(busy / 100.0, 0, 1);
         return new Sample(ratio, Percent(ratio), $"GPU Compute {Percent(ratio)}%", ratio * 100, "%");
     }
 }
@@ -1055,9 +1192,8 @@ internal sealed class VramMetric : CounterMetric
 
     public override Sample Read()
     {
-        if (!Available) return new Sample(0, "--", "VRAM 取得不可");
+        if (!TryCollect(out double used)) return new Sample(0, "--", "VRAM 取得不可");
 
-        double used = Collect();
         double usedGb = used / 1073741824.0;
 
         if (_totalBytes > 0)
@@ -1116,8 +1252,8 @@ internal sealed class DiskMetric : CounterMetric
 
     public override Sample Read()
     {
-        if (!Available) return new Sample(0, "--", "ディスク 取得不可");
-        double ratio = Math.Clamp(Collect() / 100.0, 0, 1);
+        if (!TryCollect(out double busy)) return new Sample(0, "--", "ディスク 取得不可");
+        double ratio = Math.Clamp(busy / 100.0, 0, 1);
         return new Sample(ratio, Percent(ratio), $"ディスク {Percent(ratio)}%", ratio * 100, "%");
     }
 }
@@ -1146,9 +1282,9 @@ internal sealed class NetworkMetric : CounterMetric
 
     public override Sample Read()
     {
-        if (!Available) return new Sample(0, "--", $"{Name} 取得不可");
+        if (!TryCollect(out double bytes)) return new Sample(0, "--", $"{Name} 取得不可");
 
-        double mbps = Collect() * 8 / 1_000_000.0;
+        double mbps = bytes * 8 / 1_000_000.0;
         _observedMax = Math.Max(_observedMax, mbps);
         double ratio = Math.Clamp(mbps / _observedMax, 0, 1);
         return new Sample(ratio, Compact(mbps), $"{Name} {mbps:0.0} Mbps", mbps, "Mbps");
@@ -1191,7 +1327,7 @@ internal static class IconFactory
             "................",
             "................",
             "................",
-            "......CC........",
+            "......#C........",
             "....########....",
             "..##LLLLLLLL##..",
             ".#LLLLLLLLLLLL#.",
@@ -1208,7 +1344,7 @@ internal static class IconFactory
         {
             "................",
             "................",
-            "........C.......",
+            "........#.......",
             "........C.......",
             ".....######.....",
             "...##LLLLLL##...",
@@ -1227,7 +1363,7 @@ internal static class IconFactory
         new[]
         {
             "................",
-            ".........C......",
+            ".........#......",
             "........CC......",
             ".....######.....",
             "...##LLLLLL##...",
@@ -1246,7 +1382,7 @@ internal static class IconFactory
         // あせり: さらに伸びて、毛がぴんと立つ
         new[]
         {
-            "........C.......",
+            "........#.......",
             "........C.......",
             ".....######.....",
             "...##LLLLLL##...",
@@ -1292,9 +1428,9 @@ internal static class IconFactory
     /// </summary>
     private static readonly (int Eye, int Cheek, int Mouth)[] FaceRows =
     {
-        (8, 11, 11),   // うとうと
+        (7, 10, 11),   // うとうと
         (6, 10, 11),   // ふつう
-        (6, 10, 11),   // ごきげん
+        (6, 10, 10),   // ごきげん（口が 2 行あるので 1 行上げる。下端に着くと割れて見える）
         (5,  0, 10),   // あせり
         (5,  0,  9)    // 限界
     };
@@ -1360,21 +1496,29 @@ internal static class IconFactory
             ? Blend(color, HotTone, (percent - 85) / 15.0 * 0.25)
             : color;
 
+        // 段階と計測ドットはここで 1 回だけ決める。3 モードで判定が割れると、
+        // 見た目を切り替えたときだけ挙動が違う、という直しにくい差になる。
+        int stage = mood.Stage >= 0 ? Math.Clamp(mood.Stage, 0, 4) : Stage(percent);
+        bool dot = mood.Recording && RecordingDotOn(mood.Tick);
+
+        // ゲージの赤は 85% で切り替えるのではなく、そこから 92% にかけて寄せていく。
+        // ぴったり 85% を挟んで揺れる負荷だと、切り替えでは 1 秒ごとに色が点滅する。
+        double hot = Math.Clamp((percent - HotPercent) / 7.0, 0, 1);
+
         return style switch
         {
-            IconStyle.Face => Render(BuildFace(percent, mood), tone),
+            IconStyle.Face => Render(BuildFace(stage, percent, mood, dot), tone, hot),
             IconStyle.Image when skin is not null
-                => CreateFromSkin(percent, tone, skin, smoothSkin,
-                                  mood.Recording && RecordingDotOn(mood.Tick)),
-            IconStyle.Image => Render(BuildFace(percent, mood), tone),
-            _ => Render(BuildNumber(percent, text, mood.Recording && RecordingDotOn(mood.Tick)), tone)
+                => CreateFromSkin(stage, percent, tone, skin, smoothSkin, dot),
+            IconStyle.Image => Render(BuildFace(stage, percent, mood, dot), tone, hot),
+            _ => Render(BuildNumber(percent, text, dot), tone, hot)
         };
     }
 
     // ----- グリッド共通 ---------------------------------------------------
 
     /// <summary>組み上げたグリッドを、トレイの実表示サイズちょうどに敷き詰めて Icon にする。</summary>
-    private static Icon Render(char[][] grid, Color tone)
+    private static Icon Render(char[][] grid, Color tone, double hot)
     {
         int size = Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 64);
 
@@ -1385,7 +1529,7 @@ internal static class IconFactory
             g.SmoothingMode = SmoothingMode.None;
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
             g.PixelOffsetMode = PixelOffsetMode.Half;
-            PaintSprite(g, grid, size, tone);
+            PaintSprite(g, grid, size, tone, hot);
         }
         return ToIcon(bmp);
     }
@@ -1404,6 +1548,26 @@ internal static class IconFactory
     private static int Stage(int percent)
         => percent switch { < 20 => 0, < 50 => 1, < 80 => 2, < 95 => 3, _ => 4 };
 
+    /// <summary>段階の境目。</summary>
+    private static readonly int[] StageEdges = { 20, 50, 80, 95 };
+
+    /// <summary>
+    /// 次の段階。いまの段階を渡すと、境目を 3% ぶん行き過ぎるまで切り替えない。
+    ///
+    /// 段階ごとに体の形が違うので、境目に張り付いた負荷（93〜97% を往復する学習など）を
+    /// そのまま使うと、1 秒ごとに体が上下して「震え」に見える。
+    /// 震えるアニメーションは一度入れて撤去した経緯があり、同じものを作り直さないための細工。
+    /// </summary>
+    public static int NextStage(int current, int percent)
+    {
+        const int Slack = 3;
+        int fresh = Stage(percent);
+        if (current < 0 || current > 4) return fresh;
+        if (fresh > current && percent < StageEdges[current] + Slack) return current;
+        if (fresh < current && percent > StageEdges[fresh] - Slack) return current;
+        return fresh;
+    }
+
     /// <summary>
     /// 下 2 行のゲージ。両端を 1 ドット空けて角が丸く見えるようにしてある。
     /// しきい値を超えたら 'H'（赤）で塗り、本体の色を濁らせずに危険を伝える。
@@ -1412,6 +1576,9 @@ internal static class IconFactory
     {
         char on = percent >= HotPercent ? 'H' : 'C';
         int filled = (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 14);
+        // 3% までは四捨五入で 0 マスになり、止まっているのと見分けが付かない。
+        // 少しでも動いているなら 1 マスは点ける。
+        if (percent > 0) filled = Math.Max(1, filled);
         for (int x = 1; x <= 14; x++)
         {
             char c = x - 1 < filled ? on : 'D';
@@ -1445,16 +1612,21 @@ internal static class IconFactory
     /// 目は 3x3 に取ってハイライトを 1 ドット入れてある。16px では
     /// 「目が大きい・つやがある・ほっぺがある」の 3 つがかわいさをほぼ決める。
     /// </summary>
-    private static char[][] BuildFace(int percent, IconMood mood)
+    private static char[][] BuildFace(int stage, int percent, IconMood mood, bool recordingDot)
     {
-        int stage = Stage(percent);
         char[][] grid = StageSprites[stage].Select(row => row.ToCharArray()).ToArray();
         (int eye, int cheek, int mouth) = FaceRows[stage];
 
         int t = mood.Tick;
-        // まばたき。9 秒に 1 回、そのうち 45 秒に 1 回は 2 度続けて閉じる。
-        // きっちり等間隔だと機械に見えるので、たまに崩している。
-        bool blink = t % 9 == 0 || t % 45 == 2;
+        // まばたきの時計。指標ごとに位相をずらして、並んだアイコンが一斉に目を閉じないようにする。
+        int b = t + mood.Phase;
+
+        // 13 秒に 1 回、そのうち 61 秒に 1 回は 2 度続けて閉じる。
+        // タイマーが 1 秒なので閉じ目は必ず 1 秒続く。9 秒間隔だと 1 割の時間ずっと
+        // 目を閉じていることになり、まばたきというより居眠りに見えた。
+        // t > 0 の条件は設定画面のプレビュー用。IconMood の既定値は Tick=0 なので、
+        // これが無いとプレビューが必ず閉じ目で描かれる。
+        bool blink = t > 0 && (b % 13 == 0 || b % 61 == 2);
         bool closedEyes = stage == 0 || (blink && stage is 1 or 2);
 
         void Set(int y, int x, char c)
@@ -1544,7 +1716,8 @@ internal static class IconFactory
             // この段階は体が低いぶん上に余白があるので、そこを使える。
             // 3 秒ごとに 1 ドットだけ浮き上がる。体を動かすと 1 秒タイマーでは
             // ちらついて見えるが、マークがゆっくり漂うぶんには落ち着いて見える。
-            int zy = 1 - (t / 3) % 2;
+            // 計測中の赤ドットと同時に切り替わらないよう、位相を 1 つずらしてある
+            int zy = 1 - ((t + 1) / 3) % 2;
             Set(zy, 11, 'B'); Set(zy, 12, 'B'); Set(zy, 13, 'B'); Set(zy, 14, 'B');
             Set(zy + 1, 13, 'B');
             Set(zy + 2, 12, 'B');
@@ -1563,7 +1736,7 @@ internal static class IconFactory
             }
         }
 
-        if (mood.Recording && RecordingDotOn(t)) PaintRecordingDot(grid);
+        if (recordingDot) PaintRecordingDot(grid);
         PaintGauge(grid, percent);
         return grid;
     }
@@ -1643,14 +1816,14 @@ internal static class IconFactory
         foreach ((int y, int x) in edges) grid[y][x] = '#';
     }
 
-    private static void PaintSprite(Graphics g, char[][] grid, int size, Color tone)
+    private static void PaintSprite(Graphics g, char[][] grid, int size, Color tone, double hot)
     {
         var palette = new Dictionary<char, SolidBrush>
         {
             // 輪郭は真っ黒ではなく本体色を少し混ぜた暗色にしてある。硬さが取れて印象が柔らかい。
             ['#'] = new SolidBrush(Color.FromArgb(230, Blend(Color.FromArgb(16, 16, 22), tone, 0.22))),
             ['C'] = new SolidBrush(tone),
-            ['H'] = new SolidBrush(Hot(tone)),
+            ['H'] = new SolidBrush(Blend(tone, HotTone, 0.85 * Math.Clamp(hot, 0, 1))),
             ['L'] = new SolidBrush(Blend(tone, Color.White, 0.26)),
             ['c'] = new SolidBrush(Blend(tone, Color.FromArgb(20, 20, 30), 0.22)),
             ['K'] = new SolidBrush(Color.FromArgb(238, 16, 16, 20)),
@@ -1659,7 +1832,7 @@ internal static class IconFactory
             ['B'] = new SolidBrush(Color.FromArgb(240, 130, 210, 255)),
             // ゲージの下地。薄すぎるとアイコンが欠けて見えるので、
             // 「まだ伸びていない目盛り」だと分かる程度には出しておく。
-            ['D'] = new SolidBrush(Color.FromArgb(150, 148, 148, 160)),
+            ['D'] = new SolidBrush(Color.FromArgb(190, 130, 130, 142)),
             ['R'] = new SolidBrush(Color.FromArgb(245, 235, 60, 60))
         };
 
@@ -1692,12 +1865,11 @@ internal static class IconFactory
     /// 読み込んだ絵をトレイの実サイズに合わせて描く。負荷の段階は
     /// 明るさ・赤み・マーク（zzz / 汗）・下部ゲージで表す。
     /// </summary>
-    private static Icon CreateFromSkin(int percent, Color tone, PixelSkin skin,
+    private static Icon CreateFromSkin(int stage, int percent, Color tone, PixelSkin skin,
                                        bool smooth, bool recording)
     {
         // 実際に表示される大きさ。100% 表示なら 16、150% なら 24、200% なら 32。
         int size = Math.Clamp(SystemInformation.SmallIconSize.Width, 16, 64);
-        int stage = Stage(percent);
 
         using var bmp = new Bitmap(size, size);
         using (var g = Graphics.FromImage(bmp))
@@ -1726,25 +1898,30 @@ internal static class IconFactory
             float u = size / 16f;
             RectangleF Cell(int x, int y) => new(x * u, y * u, u + 0.5f, u + 0.5f);
 
+            // マークはドット絵キャラと同じ色・同じ座標に揃える。
+            // 白のままだとライトテーマのタスクバー（ほぼ白）に溶けて消える。
+            using var mark = new SolidBrush(Color.FromArgb(240, 130, 210, 255));
             if (stage == 0)
             {
-                using var white = new SolidBrush(Color.White);
                 foreach ((int y, int x) in new[]
-                         { (0, 13), (0, 14), (0, 15), (1, 14), (2, 13), (2, 14), (2, 15) })
-                    g.FillRectangle(white, Cell(x, y));
+                         { (1, 11), (1, 12), (1, 13), (1, 14), (2, 13), (3, 12),
+                           (4, 11), (4, 12), (4, 13), (4, 14) })
+                    g.FillRectangle(mark, Cell(x, y));
             }
             else if (stage >= 3)
             {
-                using var sweat = new SolidBrush(Color.FromArgb(245, 130, 210, 255));
-                foreach ((int y, int x) in new[] { (2, 1), (3, 0), (3, 1), (4, 0), (4, 1) })
-                    g.FillRectangle(sweat, Cell(x, y));
+                foreach ((int y, int x) in new[] { (2, 1), (3, 0), (3, 1), (4, 0) })
+                    g.FillRectangle(mark, Cell(x, y));
+                if (stage == 4)
+                    foreach ((int y, int x) in new[] { (2, 14), (3, 14), (3, 15), (4, 15) })
+                        g.FillRectangle(mark, Cell(x, y));
             }
 
             // 下部のゲージ。ドット絵モードと同じ「下 2 行・両端 1 ドット空け」に揃える。
             float barTop = GaugeTop * u;
             float barLeft = u;
             float barWidth = 14 * u;
-            using (var off = new SolidBrush(Color.FromArgb(150, 148, 148, 160)))
+            using (var off = new SolidBrush(Color.FromArgb(190, 130, 130, 142)))
                 g.FillRectangle(off, barLeft, barTop, barWidth, size - barTop);
             using (var on = new SolidBrush(percent >= HotPercent ? Hot(tone) : tone))
                 g.FillRectangle(on, barLeft, barTop,
@@ -1759,12 +1936,16 @@ internal static class IconFactory
         return ToIcon(bmp);
     }
 
-    /// <summary>段階ごとの色補正。1 と 3 は素の色のままなので null を返す。</summary>
+    /// <summary>段階ごとの色補正。補正の要らない段階だけ null を返す。</summary>
     private static ImageAttributes? StageEffect(int stage)
     {
-        if (stage is 1 or 3) return null;
+        // 素の色のままでよい段階だけ null（補正なし）にする。
+        if (stage == 2) return null;
 
-        float scale = stage switch { 0 => 0.62f, 2 => 1.12f, _ => 1.0f };
+        // 負荷が上がるほど明るくする。以前は 0.62 → 1.00 → 1.12 → 1.00 → 1.00 で、
+        // 「ふつう」と「あせり」の絵が完全に同じになっていた。
+        // うとうとを 0.62 まで落とすと、いちばん長く続く状態がいちばん見えにくくもなる。
+        float scale = stage switch { 0 => 0.80f, 1 => 0.90f, 2 => 1.0f, 3 => 1.06f, _ => 1.12f };
         float addR = stage == 4 ? 0.25f : 0f;
         float addG = stage == 4 ? -0.05f : 0f;
         float addB = stage == 4 ? -0.05f : 0f;
@@ -2413,8 +2594,14 @@ internal sealed class SetupForm : Form
     {
         if (_syncing) return;
 
-        // 全部消すと右クリックする先が無くなり、設定に戻れなくなる
-        if (!box.Checked && _metricBoxes.Count(b => b.Checked) == 0)
+        // 全部消すと右クリックする先が無くなり、設定に戻れなくなる。
+        // 画面のチェックではなく設定を数えること。この画面を開いたまま
+        // トレイの右クリックからも項目を外せるので、画面の状態は古くなりうる。
+        // この指標を除いて数えること。ここに来る時点ではまだ Settings に
+        // 書き戻していないので、自分自身は有効なままに見える。
+        int others = _metrics.Count(
+            m => m.Id != metric.Id && Settings.MetricEnabled(m.Id, m.DefaultEnabled));
+        if (!box.Checked && others == 0)
         {
             _syncing = true;
             box.Checked = true;
@@ -2817,6 +3004,9 @@ internal sealed class SessionRecorder
         Recording = true;
     }
 
+    /// <summary>この指標を記録しているか。表示を切っても読み続けるかの判定に使う。</summary>
+    public bool Tracks(string id) => _values.ContainsKey(id);
+
     public void Add(DateTime time, Dictionary<string, Sample> samples)
     {
         if (!Recording) return;
@@ -2826,22 +3016,43 @@ internal sealed class SessionRecorder
         _times.Add(time);
         foreach (TrackedMetric metric in _metrics)
         {
-            samples.TryGetValue(metric.Id, out Sample sample);
-            _values[metric.Id].Add(sample.Value);
-            _ratios[metric.Id].Add(sample.Ratio);
+            // 値が来なかった指標に 0 を積むと、グラフが床に落ちて平均も薄まる。
+            // 取れなかったときは直前の値をそのまま伸ばす。
+            List<double> values = _values[metric.Id];
+            List<double> ratios = _ratios[metric.Id];
+            if (samples.TryGetValue(metric.Id, out Sample sample))
+            {
+                values.Add(sample.Value);
+                ratios.Add(sample.Ratio);
+            }
+            else
+            {
+                values.Add(values.Count > 0 ? values[^1] : 0);
+                ratios.Add(ratios.Count > 0 ? ratios[^1] : 0);
+            }
         }
 
         if (_times.Count >= MaxSamples) Thin();
     }
 
-    /// <summary>1 つおきに捨てて、以降の記録間隔も倍にする。</summary>
+    /// <summary>
+    /// 1 つおきに捨てて、以降の記録間隔も倍にする。
+    /// 途中の要素を消すと後ろが毎回ずれるので、前から詰め直してから末尾を切る。
+    /// 20000 点を 1 つずつ RemoveAt していたころは、5 時間半に 1 回
+    /// アイコンが 1 秒近く止まっていた。
+    /// </summary>
     private void Thin()
     {
-        for (int i = _times.Count - 1; i >= 0; i -= 2) _times.RemoveAt(i);
-        foreach (List<double> list in _values.Values)
-            for (int i = list.Count - 1; i >= 0; i -= 2) list.RemoveAt(i);
-        foreach (List<double> list in _ratios.Values)
-            for (int i = list.Count - 1; i >= 0; i -= 2) list.RemoveAt(i);
+        static void Halve<T>(List<T> list)
+        {
+            int write = 0;
+            for (int read = 0; read < list.Count; read += 2) list[write++] = list[read];
+            list.RemoveRange(write, list.Count - write);
+        }
+
+        Halve(_times);
+        foreach (List<double> list in _values.Values) Halve(list);
+        foreach (List<double> list in _ratios.Values) Halve(list);
         _skip *= 2;
     }
 
