@@ -1,0 +1,4 @@
+# Windows で開くファイルは CRLF に固定する。
+# .cmd と同梱の .txt が LF のままだと、環境によってメモ帳で 1 行に潰れる。
+*.cmd text eol=crlf
+*.txt text eol=crlf

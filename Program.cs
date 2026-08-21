@@ -24,6 +24,20 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
+
+        // 毎秒動く常駐なので、1 回の例外で既定のエラーダイアログが出ると、
+        // 原因が続いているあいだ 1 秒ごとにダイアログが積み上がって操作できなくなる。
+        // 同じ内容は 1 度だけ見せて、あとは動き続けるほうがましにする。
+        string? lastReported = null;
+        Application.ThreadException += (_, e) =>
+        {
+            string message = e.Exception.Message;
+            if (message == lastReported) return;
+            lastReported = message;
+            MessageBox.Show($"エラーが起きましたが、動作は続けます。\n\n{message}",
+                            "TaskbarMeter", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        };
+
         Application.Run(new MeterContext(showRequest));
     }
 }
@@ -177,6 +191,14 @@ internal sealed class MeterContext : ApplicationContext
                 // 見失わないための保険は初回に先回りして作っておく。
                 // 設定画面のチェックはこの結果をそのまま映すので、表示と実態がずれない。
                 StartMenuShortcut.Create();
+
+                // 初回はタスクバーへの表示も既定で有効にする。
+                // ③ のボタンを押さないと一度も Promote が走らず、
+                // アイコンはオーバーフロー（∧ の中）に入ったままになる。
+                // 配布でいちばんつまずくのがここなので、押し忘れに任せない。
+                Settings.PromoteTray = true;
+                _promoteTries = PromoteRetrySeconds;
+
                 ShowSetup(firstRun: true);
             }
             else if (_pendingSettings)
@@ -203,6 +225,12 @@ internal sealed class MeterContext : ApplicationContext
         // 作り直したりすると消える。希望が保存されているなら起動のたびに掛け直す。
         // 設定にはそう書いてあったが、実際には設定画面を開いたときしか掛かっていなかった。
         if (Settings.PromoteTray) _promoteTries = PromoteRetrySeconds;
+
+        // exe を別の場所へ移すと、スタートメニューのショートカットも自動起動も
+        // 消えた場所を指したまま残る。設定画面のチェックは付いたままなので、
+        // 使う側からは「設定したのに効かない」としか見えない。黙って貼り直す。
+        if (StartMenuShortcut.Exists && !StartMenuShortcut.PointsHere()) StartMenuShortcut.Create();
+        if (AutoStart.IsEnabled && !AutoStart.PointsHere()) AutoStart.Set(true);
 
         _timer.Start();
 
@@ -497,6 +525,7 @@ internal sealed class MeterContext : ApplicationContext
             preview.Result.SaveAsDefault();
             Settings.SkinSmooth = preview.Smooth;
             _skinSmooth = preview.Smooth;
+            _skin?.Dispose();
             _skin = preview.Result;
             _style = IconStyle.Image;
             Settings.Style = IconStyle.Image;
@@ -546,6 +575,10 @@ internal sealed class MeterContext : ApplicationContext
             slot.Color = Settings.MetricColor(slot.Metric.Id, slot.Metric.DefaultColor);
             slot.Notify.Visible = slot.Enabled && _iconsVisible;
         }
+
+        // 後から表示に加えた指標は、Windows 側のエントリがこのとき初めて作られる。
+        // 作られたては「オーバーフローに入れる」状態なので、掛け直しを積んでおく。
+        if (Settings.PromoteTray) _promoteTries = Math.Max(_promoteTries, PromoteRetrySeconds);
     }
 
     private IEnumerable<Slot> ActiveSlots => _slots.Values.Where(s => s.Enabled);
@@ -859,9 +892,12 @@ internal sealed class MeterContext : ApplicationContext
             ? "また使うときは、スタートメニューで「TaskbarMeter」と検索してください。"
             : $"また使うときは、この場所の exe をダブルクリックしてください。\n\n{Environment.ProcessPath}";
 
+        // 既定を「キャンセル」にしておく。Enter を押しただけで常駐が落ちると、
+        // 戻しかたを知らない人がいちばん困る。
         DialogResult answer = MessageBox.Show(
             $"TaskbarMeter を終了します。\n\n{howToReturn}",
-            "TaskbarMeter", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+            "TaskbarMeter", MessageBoxButtons.OKCancel, MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button2);
 
         if (answer == DialogResult.OK) Quit();
     }
@@ -885,6 +921,7 @@ internal sealed class MeterContext : ApplicationContext
                 slot.Current?.Dispose();
             }
             foreach (Metric metric in _metrics) metric.Dispose();
+            _skin?.Dispose();
             _menu.Dispose();
         }
         base.Dispose(disposing);
@@ -1275,10 +1312,18 @@ internal sealed class NetworkMetric : CounterMetric
     protected override string CategoryEnglish => "Network Interface";
     protected override string CounterEnglish => _received ? "Bytes Received/sec" : "Bytes Sent/sec";
 
+    /// <summary>
+    /// 仮想アダプタは除く。WSL2 や Hyper-V が入っていると、同じ通信が
+    /// 物理 NIC と vEthernet の両方で数えられて、実速度の 2 倍になる。
+    /// 深層学習の環境では WSL2 が入っていることが多いので現実に起きる。
+    /// </summary>
     protected override bool Match(string instance)
         => !instance.Contains("Loopback", StringComparison.OrdinalIgnoreCase)
         && !instance.Contains("isatap", StringComparison.OrdinalIgnoreCase)
-        && !instance.Contains("Teredo", StringComparison.OrdinalIgnoreCase);
+        && !instance.Contains("Teredo", StringComparison.OrdinalIgnoreCase)
+        && !instance.Contains("vEthernet", StringComparison.OrdinalIgnoreCase)
+        && !instance.Contains("WSL", StringComparison.OrdinalIgnoreCase)
+        && !instance.Contains("Pseudo", StringComparison.OrdinalIgnoreCase);
 
     public override Sample Read()
     {
@@ -1575,14 +1620,26 @@ internal static class IconFactory
     private static void PaintGauge(char[][] grid, int percent)
     {
         char on = percent >= HotPercent ? 'H' : 'C';
-        int filled = (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 14);
-        // 3% までは四捨五入で 0 マスになり、止まっているのと見分けが付かない。
-        // 少しでも動いているなら 1 マスは点ける。
-        if (percent > 0) filled = Math.Max(1, filled);
+
+        // 14 マスで 0〜100% を表すと 1 マスが約 7% になり、42% と 48% が同じ絵になる。
+        // 2 行あるのに同じ長さで塗っていたので、下の行だけ半マスぶん先に伸ばして
+        // 実質 28 段階にしてある。端に半分の段差が出るぶん「もう少し」が読める。
+        double exact = Math.Clamp(percent, 0, 100) / 100.0 * 14;
+        int full = (int)exact;
+        bool half = exact - full >= 0.5;
+
+        // 3% までは切り捨てで 0 マスになり、止まっているのと見分けが付かない。
+        // 少しでも動いているなら半マスは点ける。
+        if (percent > 0 && full == 0) half = true;
+
         for (int x = 1; x <= 14; x++)
         {
-            char c = x - 1 < filled ? on : 'D';
-            for (int y = GaugeTop; y < G; y++) grid[y][x] = c;
+            int index = x - 1;
+            // 半分の位置に切り欠きを入れて、目分量の基準を作る。
+            // 塗ったところには入れない。満タンのバーに穴が空くと欠けて見える。
+            if (index == 7 && index >= full) grid[GaugeTop][x] = '.';
+            else grid[GaugeTop][x] = index < full ? on : 'D';
+            grid[GaugeTop + 1][x] = index < full || (index == full && half) ? on : 'D';
         }
     }
 
@@ -1881,7 +1938,7 @@ internal static class IconFactory
                 ? InterpolationMode.HighQualityBicubic
                 : InterpolationMode.NearestNeighbor;
 
-            using (Bitmap source = skin.ToBitmap())
+            Bitmap source = skin.ToBitmap();
             using (ImageAttributes? effect = StageEffect(stage))
             {
                 var dest = new Rectangle(0, 0, size, size);
@@ -1999,7 +2056,11 @@ internal static class IconFactory
 /// トレイの実表示サイズは DPI 依存（100%=16px, 150%=24px, 200%=32px）なので、
 /// 高解像度が効くのは高 DPI 環境か、なめらか表示にしたときの陰影。
 /// </summary>
-internal sealed class PixelSkin
+/// <summary>
+/// 画像から作ったドット絵。中身は作ったあと変わらないので、
+/// Bitmap は 1 枚だけ作って使い回す。使い終わったら Dispose すること。
+/// </summary>
+internal sealed class PixelSkin : IDisposable
 {
     public static readonly int[] Resolutions = { 16, 24, 32, 48, 64 };
 
@@ -2088,13 +2149,29 @@ internal sealed class PixelSkin
     private static double Distance(Color a, Color b)
         => Math.Sqrt(Math.Pow(a.R - b.R, 2) + Math.Pow(a.G - b.G, 2) + Math.Pow(a.B - b.B, 2));
 
+    private Bitmap? _bitmap;
+
+    /// <summary>
+    /// この絵の Bitmap。**呼んだ側で破棄しないこと**（PixelSkin が持っている）。
+    /// 毎秒アイコンごとに作り直していたころは、64x64 の絵 × 8 指標で
+    /// 1 秒あたり 3 万回以上 SetPixel を回していた。
+    /// 使用率を見せるアプリが自分で CPU を食っていた。
+    /// </summary>
     public Bitmap ToBitmap()
     {
+        if (_bitmap is not null) return _bitmap;
+
         var bmp = new Bitmap(Size, Size, PixelFormat.Format32bppArgb);
         for (int y = 0; y < Size; y++)
             for (int x = 0; x < Size; x++)
                 bmp.SetPixel(x, y, Pixels[y, x]);
-        return bmp;
+        return _bitmap = bmp;
+    }
+
+    public void Dispose()
+    {
+        _bitmap?.Dispose();
+        _bitmap = null;
     }
 
     public void SaveAsDefault()
@@ -2103,8 +2180,7 @@ internal sealed class PixelSkin
         {
             string path = SavedPath;
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            using Bitmap bmp = ToBitmap();
-            bmp.Save(path, ImageFormat.Png);
+            ToBitmap().Save(path, ImageFormat.Png);
         }
         catch { /* 保存できなくても今回のセッションでは使える */ }
     }
@@ -2306,7 +2382,12 @@ internal sealed class SkinPreviewForm : Form
     }
 
     private void Rebuild()
-        => Result = PixelSkin.FromImage(_source, _resolution, _removeBackground, _posterize);
+    {
+        // 選択肢を変えるたびに作り直すので、前のぶんは捨てる（Bitmap を抱えている）
+        PixelSkin? previous = Result;
+        Result = PixelSkin.FromImage(_source, _resolution, _removeBackground, _posterize);
+        previous?.Dispose();
+    }
 
     private void DrawCheckerboard(Graphics g, Rectangle area, int cell)
     {
@@ -2323,7 +2404,7 @@ internal sealed class SkinPreviewForm : Form
         DrawCheckerboard(g, new Rectangle(0, 0, PreviewBox, PreviewBox), 12);
         if (Result is null) return;
 
-        using Bitmap bmp = Result.ToBitmap();
+        Bitmap bmp = Result.ToBitmap();
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         g.InterpolationMode = Smooth
             ? InterpolationMode.HighQualityBicubic
@@ -2335,7 +2416,7 @@ internal sealed class SkinPreviewForm : Form
     {
         if (Result is null) return;
 
-        using Bitmap bmp = Result.ToBitmap();
+        Bitmap bmp = Result.ToBitmap();
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         g.InterpolationMode = Smooth
             ? InterpolationMode.HighQualityBicubic
@@ -2420,6 +2501,11 @@ internal sealed class SetupForm : Form
 
         Add(BuildHeader(firstRun));
         Add(SectionTitle("① 表示する項目"));
+        // 「高負荷のときだけ表示」を選んでいると、ここで項目を足しても
+        // しきい値を超えるまで何も出てこない。黙っていると壊れたように見える。
+        if (Settings.Mode == DisplayMode.Auto)
+            Add(Para($"いまは「高負荷のときだけ表示」です。{Settings.Threshold}% を超えるまで" +
+                     "アイコンは出てきません（右クリック →「常に表示」で切り替えられます）。", Accent));
         Add(BuildMetricSection());
         Add(SectionTitle("② 見た目"));
         Add(BuildStyleSection());
@@ -2707,7 +2793,8 @@ internal sealed class SetupForm : Form
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Margin = new Padding(0, Unit / 3, 0, 0)
         };
-        change.Click += (_, _) => { _chooseImage(); RefreshPreviews(); };
+        // 選び直すと常駐側が Style を Image に変える。ラジオも合わせないと画面が嘘をつく
+        change.Click += (_, _) => { _chooseImage(); SyncStyleButtons(); RefreshPreviews(); };
 
         return Stack(grid, change);
     }
@@ -2835,7 +2922,13 @@ internal sealed class SetupForm : Form
             AutoStart.Set(autoStart.Checked);
         };
 
-        return Stack(startMenu, autoStart);
+        // 復帰手段は 5 系統あるのに、この画面にはチェック 2 つしか載っていなかった。
+        // 初回セットアップを閉じた人が、戻りかたを知らないまま終わってしまう。
+        Label howBack = Para(
+            "この画面は、タスクバーのアイコンを右クリック →「設定…」でいつでも開けます。\n" +
+            "Ctrl + Alt + M でアイコンを隠す／戻すの切り替えができます。", Faint);
+
+        return Stack(startMenu, autoStart, howBack);
     }
 
     // ----- 下段 -----------------------------------------------------------
@@ -3080,28 +3173,40 @@ internal sealed class SessionResultForm : Form
 
     private readonly SessionResult _result;
 
+    /// <summary>余白と寸法の基準。数値で決め打たず、文字の高さから取る。</summary>
+    private int Unit => Math.Max(16, Font.Height);
+
     public SessionResultForm(SessionResult result)
     {
         _result = result;
 
         Text = "計測結果 - TaskbarMeter";
-        ClientSize = new Size(940, 640);
+        // 画面の拡大表示（125/150/200%）では文字だけが大きくなる。
+        // 寸法を px で決め打つと、150% で集計表の下の行が枠に隠れ、
+        // 指標名も途中で切れた。他の画面と同じく Font.Height を基準にする。
+        Font = new Font("Yu Gothic UI", 9.5f);
+        AutoScaleMode = AutoScaleMode.Font;
+
+        int unit = Unit;
+        ClientSize = new Size(unit * 40, unit * 27);
+        MinimumSize = new Size(unit * 26, unit * 20);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Background;
         ForeColor = Color.White;
-        MinimumSize = new Size(640, 480);
 
         var root = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
             RowCount = 4,
-            Padding = new Padding(12)
+            Padding = new Padding(unit / 2)
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 170));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        // 表示している指標ぶんの行 ＋ 見出し。多いときはグラフを潰さない範囲で止める
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute,
+                                        unit * Math.Clamp(_result.Metrics.Count + 2, 4, 10)));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         root.Controls.Add(BuildHeader(), 0, 0);
         root.Controls.Add(BuildChart(), 0, 1);
@@ -3122,7 +3227,8 @@ internal sealed class SessionResultForm : Form
         return new Label
         {
             Dock = DockStyle.Fill,
-            Font = new Font("Yu Gothic UI", 10.5f, FontStyle.Bold),
+            AutoSize = true,
+            Font = new Font(Font, FontStyle.Bold),
             ForeColor = Color.White,
             Text = $"{_result.Start:yyyy/MM/dd HH:mm:ss}  〜  {_result.End:HH:mm:ss}    " +
                    $"（{length} / {_result.Times.Count} サンプル）"
@@ -3142,12 +3248,16 @@ internal sealed class SessionResultForm : Form
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
-        var plot = new Rectangle(area.Left + 52, area.Top + 34,
-                                 Math.Max(10, area.Width - 68),
-                                 Math.Max(10, area.Height - 62));
-
-        using var axisFont = new Font("Yu Gothic UI", 8f);
+        using var axisFont = new Font(Font.FontFamily, 8f);
         using var labelBrush = new SolidBrush(Color.FromArgb(200, 255, 255, 255));
+
+        // 余白は「100%」というラベルの実寸から決める。px で決め打つと
+        // 拡大表示のときに目盛りの文字がグラフに重なる。
+        int line = axisFont.Height;
+        int gutter = (int)Math.Ceiling(g.MeasureString("100%", axisFont).Width) + line / 2;
+        var plot = new Rectangle(area.Left + gutter, area.Top + line * 2,
+                                 Math.Max(10, area.Width - gutter - line),
+                                 Math.Max(10, area.Height - line * 4));
 
         // 目盛り（0〜100%）
         using (var gridPen = new Pen(Grid))
@@ -3157,7 +3267,7 @@ internal sealed class SessionResultForm : Form
                 int value = step * 25;
                 float y = plot.Bottom - plot.Height * value / 100f;
                 g.DrawLine(gridPen, plot.Left, y, plot.Right, y);
-                g.DrawString($"{value}%", axisFont, labelBrush, area.Left + 6, y - 8);
+                g.DrawString($"{value}%", axisFont, labelBrush, area.Left, y - line / 2f);
             }
         }
 
@@ -3166,9 +3276,10 @@ internal sealed class SessionResultForm : Form
         foreach (TrackedMetric metric in _result.Metrics)
         {
             using var swatch = new SolidBrush(metric.Color);
-            g.FillRectangle(swatch, legendX, area.Top + 10, 12, 12);
-            g.DrawString(metric.Name, axisFont, labelBrush, legendX + 16, area.Top + 8);
-            legendX += 16 + g.MeasureString(metric.Name, axisFont).Width + 18;
+            float box = line * 0.8f;
+            g.FillRectangle(swatch, legendX, area.Top + line * 0.4f, box, box);
+            g.DrawString(metric.Name, axisFont, labelBrush, legendX + box + 4, area.Top + line * 0.2f);
+            legendX += box + 4 + g.MeasureString(metric.Name, axisFont).Width + line;
         }
 
         int count = _result.Times.Count;
@@ -3195,10 +3306,10 @@ internal sealed class SessionResultForm : Form
 
         // 時刻ラベル
         g.DrawString(_result.Start.ToString("HH:mm:ss"), axisFont, labelBrush,
-                     plot.Left, plot.Bottom + 6);
+                     plot.Left, plot.Bottom + line * 0.3f);
         string endText = _result.End.ToString("HH:mm:ss");
         float endWidth = g.MeasureString(endText, axisFont).Width;
-        g.DrawString(endText, axisFont, labelBrush, plot.Right - endWidth, plot.Bottom + 6);
+        g.DrawString(endText, axisFont, labelBrush, plot.Right - endWidth, plot.Bottom + line * 0.3f);
     }
 
     private Control BuildSummary()
@@ -3213,11 +3324,13 @@ internal sealed class SessionResultForm : Form
             ForeColor = Color.White,
             BorderStyle = BorderStyle.None
         };
-        list.Columns.Add("指標", 240);
-        list.Columns.Add("平均", 110, HorizontalAlignment.Right);
-        list.Columns.Add("最大", 110, HorizontalAlignment.Right);
-        list.Columns.Add("最小", 110, HorizontalAlignment.Right);
-        list.Columns.Add("単位", 80);
+        // 「GPU 使用率 (Compute / 学習)」が入る幅を、拡大表示でも確保する
+        int unit = Unit;
+        list.Columns.Add("指標", unit * 11);
+        list.Columns.Add("平均", unit * 5, HorizontalAlignment.Right);
+        list.Columns.Add("最大", unit * 5, HorizontalAlignment.Right);
+        list.Columns.Add("最小", unit * 5, HorizontalAlignment.Right);
+        list.Columns.Add("単位", unit * 4);
 
         foreach (TrackedMetric metric in _result.Metrics)
         {
@@ -3236,21 +3349,33 @@ internal sealed class SessionResultForm : Form
 
     private Control BuildButtons()
     {
+        int unit = Unit;
         var panel = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
+            AutoSize = true,
             FlowDirection = FlowDirection.RightToLeft,
-            Padding = new Padding(0, 10, 0, 0)
+            Padding = new Padding(0, unit / 2, 0, 0)
         };
 
-        var close = new Button { Text = "閉じる", Width = 110, Height = 32, FlatStyle = FlatStyle.System };
+        Button Make(string text) => new()
+        {
+            Text = text,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            MinimumSize = new Size(unit * 6, unit * 2),
+            FlatStyle = FlatStyle.System
+        };
+
+        Button close = Make("閉じる");
         close.Click += (_, _) => Close();
 
-        var save = new Button { Text = "CSV で保存", Width = 130, Height = 32, FlatStyle = FlatStyle.System };
+        Button save = Make("CSV で保存");
         save.Click += (_, _) => SaveCsv();
 
         panel.Controls.Add(close);
         panel.Controls.Add(save);
+        CancelButton = close;   // Esc で閉じられるように
         return panel;
     }
 
@@ -3562,6 +3687,38 @@ internal static class StartMenuShortcut
         get { try { return File.Exists(LinkPath); } catch { return false; } }
     }
 
+    /// <summary>
+    /// ショートカットが「いまの exe」を指しているか。
+    /// 存在だけを見ていると、exe を別の場所へ移したあとも設定画面のチェックは
+    /// 付いたまま、実際には消えた場所を指した死んだショートカットが残る。
+    /// </summary>
+    public static bool PointsHere()
+    {
+        try
+        {
+            if (!File.Exists(LinkPath)) return false;
+
+            string? exe = Environment.ProcessPath;
+            if (exe is null) return true;
+
+            Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType is null) return true;
+
+            object? shell = Activator.CreateInstance(shellType);
+            if (shell is null) return true;
+
+            object? link = shellType.InvokeMember("CreateShortcut",
+                BindingFlags.InvokeMethod, null, shell, new object[] { LinkPath });
+            if (link is null) return true;
+
+            object? target = link.GetType().InvokeMember(
+                "TargetPath", BindingFlags.GetProperty, null, link, null);
+
+            return string.Equals(target as string, exe, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return true; }   // 読めないなら触らない
+    }
+
     public static bool Create()
     {
         try
@@ -3619,11 +3776,33 @@ internal static class AutoStart
         }
     }
 
+    /// <summary>
+    /// 登録されている値が「いまの exe」を指しているか。
+    /// 存在だけを見ていると、exe を移したあとも設定画面のチェックは付いたまま、
+    /// 実際には起動しない状態になる。
+    /// </summary>
+    public static bool PointsHere()
+    {
+        try
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKey);
+            if (key?.GetValue(ValueName) is not string stored) return false;
+
+            string? exe = Environment.ProcessPath;
+            if (exe is null) return true;
+
+            return string.Equals(stored.Trim('"'), exe, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return true; }
+    }
+
     public static void Set(bool enabled)
     {
         try
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
+            // CreateSubKey にしてあるのは、Run キーが無い環境で
+            // 「チェックは入るのに何も保存されない」を避けるため。
+            using RegistryKey? key = Registry.CurrentUser.CreateSubKey(RunKey, writable: true);
             if (key is null) return;
             if (enabled)
             {
